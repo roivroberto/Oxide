@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use oxide_ide::{
     AppModel, ClientStartId, ClientSubmission, ClosureHealth, ControlAvailability, Envelope,
     EventSequence, ExecutionViewState, FileFailureKind, FileModelEvent, MAX_OPEN_FILE_BYTES,
-    MAX_VISIBLE_OUTPUT_BYTES, MAX_WIRE_DOCUMENT_JSON_BYTES, ModelEffect, ModelEvent, ModelStatus,
-    OUTPUT_TRUNCATION_MARKER, RequestId, RunBinding, RunId, RunMode, SnapshotProvenance,
-    SupervisorModelEvent, UiAction, UnsavedChoice, WireDiagnostic, WireRuntimeFrame, WorkerEvent,
-    WorkerSessionId, WorkerTerminationReason, apply_event,
+    MAX_SOURCE_LINES, MAX_VISIBLE_OUTPUT_BYTES, MAX_VISIBLE_OUTPUT_LINES,
+    MAX_WIRE_DOCUMENT_JSON_BYTES, ModelEffect, ModelEvent, ModelStatus, OUTPUT_TRUNCATION_MARKER,
+    RequestId, RunBinding, RunId, RunMode, SnapshotProvenance, SupervisorModelEvent, UiAction,
+    UnsavedChoice, WireDiagnostic, WireRuntimeFrame, WorkerEvent, WorkerSessionId,
+    WorkerTerminationReason, apply_event,
 };
 use rlox::{
     ActivationId, DebugPointId, DiagnosticPhase, DiagnosticSeverity, FrameSnapshot, PauseLocation,
@@ -575,7 +576,13 @@ fn frame_and_problem_navigation_do_not_overwrite_execution_or_fault_markers() {
             activation_id: ActivationId(7),
         }),
     );
-    assert!(matches!(effects.as_slice(), [ModelEffect::Navigate { .. }]));
+    assert!(matches!(
+        effects.as_slice(),
+        [ModelEffect::Navigate {
+            run: effect_run,
+            ..
+        }] if *effect_run == run
+    ));
     assert_eq!(model.current_span(), current);
     assert_eq!(model.fault_span(), None);
 
@@ -607,10 +614,17 @@ fn frame_and_problem_navigation_do_not_overwrite_execution_or_fault_markers() {
     );
     let fault = faulted.fault_span();
     let problem = faulted.problems()[0].id();
-    apply_event(
+    let effects = apply_event(
         &mut faulted,
         ModelEvent::Ui(UiAction::SelectProblem(problem)),
     );
+    assert!(matches!(
+        effects.as_slice(),
+        [ModelEffect::Navigate {
+            run: effect_run,
+            ..
+        }] if *effect_run == run
+    ));
     assert_eq!(faulted.fault_span(), fault);
     assert!(faulted.navigation_span().is_some());
 }
@@ -877,6 +891,21 @@ fn output_cap_is_utf8_safe_and_renders_one_marker_inside_cap() {
 }
 
 #[test]
+fn output_line_cap_prevents_pathological_layouts() {
+    let (mut model, run) = running_model(RunMode::Run);
+    let text = "\n".repeat(MAX_VISIBLE_OUTPUT_LINES + 1);
+    apply_event(&mut model, worker(run, 2, 1, WorkerEvent::Output { text }));
+
+    let rendered = model.rendered_output();
+    assert_eq!(rendered.matches(OUTPUT_TRUNCATION_MARKER).count(), 1);
+    assert_eq!(
+        rendered.matches('\n').count(),
+        MAX_VISIBLE_OUTPUT_LINES + OUTPUT_TRUNCATION_MARKER.matches('\n').count() - 1
+    );
+    assert!(model.output_was_truncated());
+}
+
+#[test]
 fn malformed_nested_span_is_rejected_atomically() {
     let (mut model, run) = running_model(RunMode::Run);
     let mut invalid = diagnostic(run, "bad span");
@@ -1114,6 +1143,49 @@ fn open_rejects_adapter_data_larger_than_the_declared_limit() {
 }
 
 #[test]
+fn open_rejects_pathological_line_counts_without_replacing_the_document() {
+    let mut model = AppModel::new();
+    set_source(&mut model, SOURCE);
+    let original = model.document().unwrap().clone();
+    let prompt = apply_event(&mut model, ModelEvent::Ui(UiAction::Open));
+    let [ModelEffect::PromptUnsaved { operation_id, .. }] = prompt.as_slice() else {
+        panic!("expected unsaved prompt");
+    };
+    let picker = apply_event(
+        &mut model,
+        ModelEvent::Ui(UiAction::ResolveUnsaved {
+            operation_id: *operation_id,
+            choice: UnsavedChoice::Discard,
+        }),
+    );
+    let [ModelEffect::PickOpen { operation_id }] = picker.as_slice() else {
+        panic!("expected open picker");
+    };
+    let operation_id = *operation_id;
+    apply_event(
+        &mut model,
+        ModelEvent::File(FileModelEvent::OpenPicked {
+            operation_id,
+            path: Some(PathBuf::from(r"C:\Users\Roi\too-many-lines.lox")),
+        }),
+    );
+    apply_event(
+        &mut model,
+        ModelEvent::File(FileModelEvent::ReadFinished {
+            operation_id,
+            result: Ok("\n".repeat(MAX_SOURCE_LINES).into_bytes()),
+        }),
+    );
+
+    assert_eq!(model.document(), Some(&original));
+    assert_eq!(model.status(), Some(&ModelStatus::SourceLimitReached));
+    assert!(matches!(
+        apply_event(&mut model, ModelEvent::Ui(UiAction::Open)).as_slice(),
+        [ModelEffect::PromptUnsaved { .. }]
+    ));
+}
+
+#[test]
 fn unicode_source_positions_are_validated_by_scalar_column() {
     const UNICODE_SOURCE: &str = "print \"🦀\";\nprint \"語\";\n";
     let mut model = AppModel::new();
@@ -1238,6 +1310,45 @@ fn wire_oversized_text_can_be_edited_down_but_cannot_run() {
     );
     assert_eq!(model.document().unwrap().text(), SOURCE);
     assert_eq!(model.controls(), ready());
+}
+
+#[test]
+fn interactively_oversized_text_is_rejected_atomically_and_a_valid_edit_recovers() {
+    let mut model = AppModel::new();
+    let original = model.document().unwrap().clone();
+    let oversized = "x".repeat(MAX_OPEN_FILE_BYTES + 1);
+    set_source(&mut model, &oversized);
+    assert_eq!(model.document(), Some(&original));
+    assert_eq!(model.status(), Some(&ModelStatus::SourceLimitReached));
+
+    let stamp = model.document().unwrap().stamp();
+    apply_event(
+        &mut model,
+        ModelEvent::Ui(UiAction::Edit {
+            document: stamp,
+            text: SOURCE.to_string(),
+        }),
+    );
+    assert_eq!(model.document().unwrap().text(), SOURCE);
+    assert_eq!(model.status(), None);
+    assert_eq!(model.controls(), ready());
+}
+
+#[test]
+fn interactively_excessive_line_count_is_rejected_atomically() {
+    let mut model = AppModel::new();
+    let original = model.document().unwrap().clone();
+    let stamp = original.stamp();
+    apply_event(
+        &mut model,
+        ModelEvent::Ui(UiAction::Edit {
+            document: stamp,
+            text: "\n".repeat(MAX_SOURCE_LINES),
+        }),
+    );
+
+    assert_eq!(model.document(), Some(&original));
+    assert_eq!(model.status(), Some(&ModelStatus::SourceLimitReached));
 }
 
 #[test]
@@ -1731,4 +1842,164 @@ fn stale_close_cannot_retire_an_undispatched_generation_during_exit() {
         .as_slice(),
         [ModelEffect::AuthorizeClose { .. }]
     ));
+}
+
+#[test]
+fn runtime_disconnect_marks_an_idle_model_failed_and_is_idempotent() {
+    let mut model = AppModel::new();
+    assert!(
+        apply_event(
+            &mut model,
+            ModelEvent::Supervisor(SupervisorModelEvent::RuntimeDisconnected),
+        )
+        .is_empty()
+    );
+    assert_eq!(model.execution_state(), ExecutionViewState::WorkerCrashed);
+    assert_eq!(model.status(), Some(&ModelStatus::RuntimeDisconnected));
+    assert_eq!(model.active_run(), None);
+    assert!(!model.cleanup_pending());
+    assert!(!model.stop_requested());
+
+    let recovered = model.clone();
+    assert!(
+        apply_event(
+            &mut model,
+            ModelEvent::Supervisor(SupervisorModelEvent::RuntimeDisconnected),
+        )
+        .is_empty()
+    );
+    assert_eq!(model, recovered);
+}
+
+#[test]
+fn runtime_disconnect_retires_deferred_start_and_cleanup_generation() {
+    let (mut model, completed_run) = running_model(RunMode::Run);
+    apply_event(
+        &mut model,
+        worker(completed_run, 2, 1, WorkerEvent::Completed),
+    );
+    assert!(model.cleanup_pending());
+    assert!(apply_event(&mut model, ModelEvent::Ui(UiAction::Run)).is_empty());
+    assert_eq!(model.execution_state(), ExecutionViewState::Starting);
+
+    assert!(
+        apply_event(
+            &mut model,
+            ModelEvent::Supervisor(SupervisorModelEvent::RuntimeDisconnected),
+        )
+        .is_empty()
+    );
+    assert_eq!(model.execution_state(), ExecutionViewState::WorkerCrashed);
+    assert!(!model.cleanup_pending());
+
+    let recovered = model.clone();
+    assert!(
+        apply_event(
+            &mut model,
+            ModelEvent::Supervisor(SupervisorModelEvent::Closed {
+                client_start_id: None,
+                worker_session_id: completed_run.worker_session_id,
+                run: Some(completed_run),
+                health: ClosureHealth::Clean,
+            }),
+        )
+        .is_empty()
+    );
+    assert_eq!(model, recovered, "the deferred start must not be launched");
+}
+
+#[test]
+fn runtime_disconnect_retires_commands_and_preserves_only_a_nonlive_snapshot() {
+    let (mut model, run) = running_model(RunMode::Debug);
+    apply_event(
+        &mut model,
+        worker(run, 2, 1, paused_event(run, 2, PauseReason::DebugPoint)),
+    );
+    assert!(model.retained_snapshot().unwrap().is_live());
+    assert!(matches!(
+        apply_event(&mut model, ModelEvent::Ui(UiAction::Continue)).as_slice(),
+        [ModelEffect::SubmitCommand(_)]
+    ));
+    assert!(matches!(
+        apply_event(&mut model, ModelEvent::Ui(UiAction::Stop)).as_slice(),
+        [ModelEffect::SubmitCommand(_)]
+    ));
+
+    assert!(
+        apply_event(
+            &mut model,
+            ModelEvent::Supervisor(SupervisorModelEvent::RuntimeDisconnected),
+        )
+        .is_empty()
+    );
+    assert_eq!(model.active_run(), None);
+    assert!(!model.cleanup_pending());
+    assert!(!model.stop_requested());
+    assert_eq!(model.current_span(), None);
+    let retained = model.retained_snapshot().unwrap();
+    assert!(!retained.is_live());
+    assert_eq!(retained.provenance(), SnapshotProvenance::LastSafePause);
+
+    let start_id = begin_start(&mut model, RunMode::Run);
+    let replacement = binding(401);
+    admit_start(&mut model, start_id, RunMode::Run, replacement);
+    assert!(
+        model.controls().pause,
+        "the pending command must be retired"
+    );
+    assert!(model.controls().stop, "the pending stop must be retired");
+}
+
+#[test]
+fn runtime_disconnect_clears_input_and_authorizes_a_waiting_exit_once() {
+    let (mut model, run) = running_model(RunMode::Run);
+    apply_event(
+        &mut model,
+        worker(
+            run,
+            2,
+            1,
+            WorkerEvent::InputRequested {
+                prompt: "value: ".to_string(),
+            },
+        ),
+    );
+    assert!(model.pending_input().is_some());
+
+    let prompt = apply_event(&mut model, ModelEvent::Ui(UiAction::RequestExit));
+    let [ModelEffect::PromptUnsaved { operation_id, .. }] = prompt.as_slice() else {
+        panic!("expected exit prompt: {prompt:?}");
+    };
+    assert!(matches!(
+        apply_event(
+            &mut model,
+            ModelEvent::Ui(UiAction::ResolveUnsaved {
+                operation_id: *operation_id,
+                choice: UnsavedChoice::Discard,
+            }),
+        )
+        .as_slice(),
+        [ModelEffect::CloseWorker { .. }]
+    ));
+
+    let effects = apply_event(
+        &mut model,
+        ModelEvent::Supervisor(SupervisorModelEvent::RuntimeDisconnected),
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [ModelEffect::AuthorizeClose { .. }]
+    ));
+    assert_eq!(model.pending_input(), None);
+    assert_eq!(model.execution_state(), ExecutionViewState::WorkerCrashed);
+    assert_eq!(model.status(), Some(&ModelStatus::RuntimeDisconnected));
+
+    assert!(
+        apply_event(
+            &mut model,
+            ModelEvent::Supervisor(SupervisorModelEvent::RuntimeDisconnected),
+        )
+        .is_empty(),
+        "close authorization must be one-shot"
+    );
 }

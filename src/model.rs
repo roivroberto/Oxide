@@ -13,8 +13,10 @@ use crate::{
 };
 
 pub const MAX_VISIBLE_OUTPUT_BYTES: usize = 1024 * 1024;
+pub const MAX_VISIBLE_OUTPUT_LINES: usize = 10_000;
 pub const OUTPUT_TRUNCATION_MARKER: &str = "\n[output truncated]\n";
-pub const MAX_OPEN_FILE_BYTES: usize = crate::MAX_PAYLOAD_BYTES;
+pub const MAX_OPEN_FILE_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_SOURCE_LINES: usize = 10_000;
 const MAX_PROBLEM_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROBLEMS: usize = 256;
 
@@ -74,7 +76,9 @@ impl DocumentBuffer {
     fn loaded(id: DocumentId, path: PathBuf, text: String) -> Self {
         let text: Arc<str> = Arc::from(normalize_source(&text));
         let display_name = safe_display_name(&path);
-        let wire_compatible = WireDocument::validate_content(&display_name, &text).is_ok();
+        let wire_compatible = text.len() <= MAX_OPEN_FILE_BYTES
+            && source_line_count(&text) <= MAX_SOURCE_LINES
+            && WireDocument::validate_content(&display_name, &text).is_ok();
         Self {
             id,
             edit_revision: EditRevision(1),
@@ -116,7 +120,7 @@ impl DocumentBuffer {
         self.path
             .as_deref()
             .map(safe_display_name)
-            .unwrap_or_else(|| "untitled.lox".to_string())
+            .unwrap_or_else(|| "untitled.ox".to_string())
     }
 }
 
@@ -126,6 +130,14 @@ fn normalize_source(value: &str) -> String {
         .unwrap_or(value)
         .replace("\r\n", "\n")
         .replace('\r', "\n")
+}
+
+fn source_line_count(value: &str) -> usize {
+    value
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        .saturating_add(1)
 }
 
 fn safe_display_name(path: &Path) -> String {
@@ -148,7 +160,7 @@ fn safe_display_name(path: &Path) -> String {
     }
     let trimmed = value.trim();
     if trimmed.is_empty() || matches!(trimmed, "." | "..") {
-        "source.lox".to_string()
+        "source.ox".to_string()
     } else {
         trimmed.to_string()
     }
@@ -185,6 +197,16 @@ pub struct ControlAvailability {
     pub stop: bool,
     pub editor: bool,
     pub submit_input: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileControlAvailability {
+    pub new: bool,
+    pub open: bool,
+    pub save: bool,
+    pub save_as: bool,
+    pub close_document: bool,
+    pub exit: bool,
 }
 
 impl ControlAvailability {
@@ -343,6 +365,7 @@ pub enum ModelEffect {
     },
     Navigate {
         document: DocumentStamp,
+        run: RunBinding,
         span: SourceSpan,
     },
     AuthorizeClose {
@@ -399,6 +422,7 @@ pub enum ClientSubmission {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SupervisorModelEvent {
+    RuntimeDisconnected,
     Started {
         client_start_id: ClientStartId,
         mode: RunMode,
@@ -471,6 +495,7 @@ pub enum ModelEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelStatus {
     IdExhausted,
+    RuntimeDisconnected,
     StartFailed(std::io::ErrorKind),
     StartRejected(SubmitError),
     CommandRejected {
@@ -487,6 +512,7 @@ pub enum ModelStatus {
     FileFailed(FileFailureKind),
     InvalidUtf8,
     ProblemLimitReached,
+    SourceLimitReached,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -579,6 +605,7 @@ pub struct PendingInput {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 struct ProgramOutput {
     text: String,
+    line_breaks: usize,
     model_truncated: bool,
     worker_truncated: bool,
 }
@@ -592,19 +619,27 @@ impl ProgramOutput {
         if self.model_truncated {
             return;
         }
-        let marker = OUTPUT_TRUNCATION_MARKER.len();
-        if self.text.len().saturating_add(value.len()) <= MAX_VISIBLE_OUTPUT_BYTES {
-            self.text.push_str(value);
-            return;
-        }
-        let maximum_prefix = MAX_VISIBLE_OUTPUT_BYTES.saturating_sub(marker);
-        let available = maximum_prefix.saturating_sub(self.text.len());
+        let available = MAX_VISIBLE_OUTPUT_BYTES.saturating_sub(self.text.len());
         let mut end = available.min(value.len());
         while !value.is_char_boundary(end) {
             end -= 1;
         }
+        let remaining_line_breaks = MAX_VISIBLE_OUTPUT_LINES
+            .saturating_sub(1)
+            .saturating_sub(self.line_breaks);
+        let mut accepted_line_breaks = 0;
+        for (index, byte) in value.as_bytes()[..end].iter().enumerate() {
+            if *byte == b'\n' {
+                if accepted_line_breaks == remaining_line_breaks {
+                    end = index;
+                    break;
+                }
+                accepted_line_breaks += 1;
+            }
+        }
         self.text.push_str(&value[..end]);
-        self.model_truncated = true;
+        self.line_breaks = self.line_breaks.saturating_add(accepted_line_breaks);
+        self.model_truncated = end < value.len();
     }
 
     fn rendered(&self) -> Cow<'_, str> {
@@ -917,6 +952,19 @@ impl AppModel {
         controls
     }
 
+    pub fn file_controls(&self) -> FileControlAvailability {
+        let idle_file_lane = self.pending_file.is_none() && self.exit_state == ExitState::None;
+        let can_replace = document_replacement_allowed(self);
+        FileControlAvailability {
+            new: can_replace,
+            open: can_replace,
+            save: idle_file_lane && self.document.is_some(),
+            save_as: idle_file_lane && self.document.is_some(),
+            close_document: can_replace && self.document.is_some(),
+            exit: idle_file_lane,
+        }
+    }
+
     pub fn program_output(&self) -> &str {
         &self.output.text
     }
@@ -985,6 +1033,10 @@ impl AppModel {
 
     pub fn cleanup_pending(&self) -> bool {
         self.cleanup_run.is_some()
+    }
+
+    pub fn exit_resolution_active(&self) -> bool {
+        self.exit_state != ExitState::None
     }
 
     fn allocate_id(slot: &mut Option<u64>) -> Option<u64> {
@@ -1082,6 +1134,10 @@ fn apply_edit(model: &mut AppModel, stamp: DocumentStamp, text: String) {
         return;
     }
     let normalized = normalize_source(&text);
+    if normalized.len() > MAX_OPEN_FILE_BYTES || source_line_count(&normalized) > MAX_SOURCE_LINES {
+        model.status = Some(ModelStatus::SourceLimitReached);
+        return;
+    }
     let Some(document) = model.document.as_mut() else {
         return;
     };
@@ -1093,10 +1149,15 @@ fn apply_edit(model: &mut AppModel, stamp: DocumentStamp, text: String) {
         return;
     };
     let display_name = document.display_name();
-    let wire_compatible = WireDocument::validate_content(&display_name, &normalized).is_ok();
+    let wire_compatible = normalized.len() <= MAX_OPEN_FILE_BYTES
+        && source_line_count(&normalized) <= MAX_SOURCE_LINES
+        && WireDocument::validate_content(&display_name, &normalized).is_ok();
     document.edit_revision = EditRevision(next_revision);
     document.text = Arc::from(normalized);
     document.wire_compatible = wire_compatible;
+    if matches!(model.status, Some(ModelStatus::SourceLimitReached)) {
+        model.status = None;
+    }
     if matches!(
         model.execution_state,
         ExecutionViewState::Completed
@@ -1638,6 +1699,12 @@ fn finish_read(
         model.status = Some(ModelStatus::InvalidUtf8);
         return Vec::new();
     };
+    let text = normalize_source(&text);
+    if source_line_count(&text) > MAX_SOURCE_LINES {
+        model.pending_file = None;
+        model.status = Some(ModelStatus::SourceLimitReached);
+        return Vec::new();
+    }
     let Some(document_id) = model.allocate_document_id() else {
         model.pending_file = None;
         model.exhausted();
@@ -1709,6 +1776,7 @@ fn finish_write(
 
 fn apply_supervisor_event(model: &mut AppModel, event: SupervisorModelEvent) -> Vec<ModelEffect> {
     match event {
+        SupervisorModelEvent::RuntimeDisconnected => runtime_disconnected(model),
         SupervisorModelEvent::Started {
             client_start_id,
             mode,
@@ -1763,6 +1831,27 @@ fn apply_supervisor_event(model: &mut AppModel, event: SupervisorModelEvent) -> 
             health,
         } => worker_closed(model, client_start_id, worker_session_id, run, health),
     }
+}
+
+fn runtime_disconnected(model: &mut AppModel) -> Vec<ModelEffect> {
+    model.pending_run = None;
+    model.active_run = None;
+    model.cleanup_run = None;
+    model.terminal_barrier = None;
+    model.pending_command = None;
+    model.pending_stop = None;
+    model.pending_input = None;
+    model.current_span = None;
+    model.stop_requested = false;
+    if let Some(snapshot) = model.retained_snapshot.as_mut() {
+        snapshot.live = false;
+        if snapshot.provenance == SnapshotProvenance::Paused {
+            snapshot.provenance = SnapshotProvenance::LastSafePause;
+        }
+    }
+    model.execution_state = ExecutionViewState::WorkerCrashed;
+    model.status = Some(ModelStatus::RuntimeDisconnected);
+    authorize_exit_after_reap(model)
 }
 
 fn start_admitted(
@@ -2607,9 +2696,14 @@ fn select_problem(model: &mut AppModel, problem_id: ProblemId) -> Vec<ModelEffec
     }
     let span = problem.diagnostic.span;
     let document = problem.document;
+    let run = problem.run;
     model.selected_problem = Some(problem_id);
     model.navigation_span = Some(span);
-    vec![ModelEffect::Navigate { document, span }]
+    vec![ModelEffect::Navigate {
+        document,
+        run,
+        span,
+    }]
 }
 
 fn select_frame(
@@ -2638,7 +2732,12 @@ fn select_frame(
     };
     let span = frame.current_span;
     let document = retained.document;
+    let run = retained.run;
     model.selected_activation = Some(activation_id);
     model.navigation_span = Some(span);
-    vec![ModelEffect::Navigate { document, span }]
+    vec![ModelEffect::Navigate {
+        document,
+        run,
+        span,
+    }]
 }

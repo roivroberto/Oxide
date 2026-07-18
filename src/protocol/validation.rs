@@ -379,9 +379,7 @@ fn validate_snapshot(
 }
 
 fn validate_binding(binding: &BindingSnapshot) -> Result<(), StreamValidationError> {
-    if binding.binding_id.is_some_and(|id| id.0 == 0)
-        || !value_kind_matches(binding.value_kind, &binding.value)
-    {
+    if !value_kind_matches(binding.value_kind, &binding.value) {
         return Err(StreamValidationError::InvalidPayload);
     }
     validate_debug_value(&binding.value, 0)

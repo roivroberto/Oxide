@@ -294,6 +294,53 @@ fn debug_step_continue_preserves_causal_requests() {
 }
 
 #[test]
+fn debug_step_into_function_preserves_worker_and_frames() {
+    let run = RunId(15);
+    let revision = RevisionId(11);
+    let mut worker = WorkerProcess::spawn(WorkerSessionId(49));
+    let source = "fun add(a, b) {\n  var total = a + b;\n  print total;\n}\n\nadd(2, 3);\n";
+    worker.send(
+        run,
+        revision,
+        Command::LoadAndDebug {
+            document: WireDocument {
+                source_id: SourceId(18),
+                revision,
+                display_name: "step-function.ox".to_string(),
+                text: source.to_string(),
+            },
+        },
+    );
+    assert!(matches!(
+        worker.receive().payload,
+        WorkerEvent::Paused { .. }
+    ));
+
+    let step_over = worker.send(run, revision, Command::StepOver);
+    let event = worker.receive();
+    assert_eq!(event.request_id, step_over);
+    assert!(matches!(event.payload, WorkerEvent::Paused { .. }));
+
+    let step_into = worker.send(run, revision, Command::StepInto);
+    let event = worker.receive();
+    assert_eq!(event.request_id, step_into);
+    let WorkerEvent::Paused { snapshot, .. } = event.payload else {
+        panic!("expected a pause inside add")
+    };
+    assert!(
+        snapshot.frames.iter().any(|frame| frame.function == "add"),
+        "step into must expose the called frame"
+    );
+
+    let stop = worker.send(run, revision, Command::Stop);
+    let event = worker.receive();
+    assert_eq!(event.request_id, stop);
+    assert!(matches!(event.payload, WorkerEvent::Cancelled { .. }));
+    worker.send(run, revision, Command::Shutdown);
+    worker.finish();
+}
+
+#[test]
 fn explicit_pause_then_stop_cancels_without_executing_paused_opcode() {
     let run = RunId(9);
     let revision = RevisionId(5);

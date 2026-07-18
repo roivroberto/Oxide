@@ -1,51 +1,51 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::process::ExitCode;
 
-use oxide_ide::{WorkerSessionId, run_worker};
+use oxide_ide::{APP_NAME, LaunchMode, route_arguments, run_visible, run_worker};
+
+const MAX_STARTUP_DETAIL_CHARS: usize = 2_048;
 
 fn main() -> ExitCode {
-    let mut arguments = std::env::args_os();
-    let _program = arguments.next();
-    match arguments.next().and_then(|value| value.into_string().ok()) {
-        None => ExitCode::SUCCESS,
-        Some(mode) if mode == "--worker" => {
-            if arguments
-                .next()
-                .and_then(|value| value.into_string().ok())
-                .as_deref()
-                != Some("--worker-session")
-            {
-                return ExitCode::from(64);
+    let mode = match route_arguments(std::env::args_os().skip(1)) {
+        Ok(mode) => mode,
+        Err(_) => return ExitCode::from(64),
+    };
+    match mode {
+        LaunchMode::Visible => match run_visible() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                report_visible_startup_error(&error);
+                ExitCode::from(70)
             }
-            let Some(session) = arguments
-                .next()
-                .and_then(|value| value.into_string().ok())
-                .and_then(|value| parse_session_id(&value))
-            else {
-                return ExitCode::from(64);
-            };
-            if arguments.next().is_some() {
-                return ExitCode::from(64);
-            }
-            match run_worker(
-                std::io::stdin(),
-                std::io::stdout(),
-                WorkerSessionId(session),
-            ) {
+        },
+        LaunchMode::Worker(session) => {
+            match run_worker(std::io::stdin(), std::io::stdout(), session) {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(_) => ExitCode::from(70),
+                Err(error) => {
+                    eprintln!("Oxide IDE worker failed: {error:?}");
+                    ExitCode::from(70)
+                }
             }
         }
-        Some(_) => ExitCode::from(64),
     }
 }
 
-fn parse_session_id(value: &str) -> Option<u64> {
-    if value.is_empty()
-        || value.starts_with('0')
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
+fn report_visible_startup_error(error: &eframe::Error) {
+    let detail = error.to_string();
+    let mut characters = detail.chars();
+    let mut detail: String = characters.by_ref().take(MAX_STARTUP_DETAIL_CHARS).collect();
+    if characters.next().is_some() {
+        detail.push('…');
     }
-    let parsed = value.parse::<u64>().ok()?;
-    (parsed.to_string() == value).then_some(parsed)
+    let message = format!(
+        "{APP_NAME} could not start.\n\n{detail}\n\nCheck Windows and the graphics driver, then try again."
+    );
+    eprintln!("{message}");
+    let _ = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title(APP_NAME)
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }

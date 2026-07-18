@@ -4,7 +4,15 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[build-dependencies]
+embed-resource = "=3.0.11"
+
 [dependencies]
+eframe = { version = "=0.35.0", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
 rlox = { path = "../.." }
+rfd = { version = "=0.17.2", features = ["common-controls-v6"] }
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+egui_kittest = { version = "=0.35.0", default-features = false, features = ["eframe"] }

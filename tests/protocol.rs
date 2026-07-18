@@ -46,7 +46,7 @@ fn snapshot(reason: SnapshotReason, source_id: u64, revision: u64) -> VmSnapshot
             parameters: Vec::new(),
             parameters_truncated: false,
             locals: vec![BindingSnapshot {
-                binding_id: Some(BindingId(1)),
+                binding_id: Some(BindingId(0)),
                 name: "answer".to_string(),
                 name_truncated: false,
                 binding_kind: "local".to_string(),
