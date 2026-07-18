@@ -1,0 +1,135 @@
+name: Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: "1.97.0"
+  WINDOWS_TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  test-and-package:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out Oxide
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: >-
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN
+          --profile minimal
+          --component rustfmt
+          --component clippy
+          --target $env:WINDOWS_TARGET
+
+      - name: Test packaging helpers
+        shell: pwsh
+        run: ./scripts/test-package-windows.ps1
+
+      - name: Resolve exact RLox revision
+        id: backend-revision
+        shell: pwsh
+        run: |
+          $revision = ./scripts/package-windows.ps1 -PrintBackendRevision
+          if ($revision -notmatch '\A[0-9a-f]{40}\z') {
+              throw "Packaging returned an invalid RLox revision: $revision"
+          }
+          "sha=$revision" >> $env:GITHUB_OUTPUT
+
+      - name: Check out pinned RLox backend
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: fonzy1243/RLox
+          ref: ${{ steps.backend-revision.outputs.sha }}
+          path: _backend/rlox
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify backend and lockfile provenance
+        shell: pwsh
+        run: >-
+          ./scripts/package-windows.ps1
+          -ValidateOnly
+          -BackendDirectory "$env:GITHUB_WORKSPACE/_backend/rlox"
+
+      - name: Check formatting
+        shell: pwsh
+        run: >-
+          cargo fmt
+          --all
+          --manifest-path "$env:GITHUB_WORKSPACE/Cargo.toml"
+          --
+          --check
+
+      - name: Test Oxide
+        shell: pwsh
+        run: >-
+          cargo test
+          --locked
+          --manifest-path "$env:GITHUB_WORKSPACE/Cargo.toml"
+          --all-targets
+          --target $env:WINDOWS_TARGET
+
+      - name: Lint Oxide
+        shell: pwsh
+        run: >-
+          cargo clippy
+          --locked
+          --manifest-path "$env:GITHUB_WORKSPACE/Cargo.toml"
+          --all-targets
+          --target $env:WINDOWS_TARGET
+          --no-deps
+          --
+          -D warnings
+
+      - name: Build Oxide release
+        shell: pwsh
+        run: >-
+          cargo build
+          --locked
+          --release
+          --manifest-path "$env:GITHUB_WORKSPACE/Cargo.toml"
+          --target $env:WINDOWS_TARGET
+
+      - name: Build pinned RLox tools
+        shell: pwsh
+        run: >-
+          cargo build
+          --locked
+          --release
+          --manifest-path "$env:GITHUB_WORKSPACE/_backend/rlox/Cargo.toml"
+          --target $env:WINDOWS_TARGET
+          -p rlox
+          -p rlox-lsp
+
+      - name: Package release
+        shell: pwsh
+        run: >-
+          ./scripts/package-windows.ps1
+          -SkipBuild
+          -BackendDirectory "$env:GITHUB_WORKSPACE/_backend/rlox"
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oxide-ide-windows-x86_64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error

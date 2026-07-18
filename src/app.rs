@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
-use eframe::egui::text::CCursorRange;
+use eframe::egui::text::{CCursorRange, CharIndex};
 use eframe::egui::{
     self, Button, CentralPanel, Color32, Frame, Key, KeyboardShortcut, MenuBar, Modifiers, Panel,
     RichText, ScrollArea, TextEdit,
@@ -13,14 +14,24 @@ use crate::file_dialog::{
     FileEventReceiver, FileExecutor, FileJob, FileSubmitError, show_open_dialog, show_save_dialog,
     show_unsaved_dialog,
 };
+use crate::language::{
+    AnalysisPhase, DefinitionResultId, DiagnosticItemId, DiagnosticSetRevision,
+    DiagnosticSeverity as AnalysisSeverity, DiagnosticSnapshot, LanguageCoordinator,
+    LanguageSnapshot, LanguageStatus, NoticeId, ProcessGeneration, SyntaxKind, synthetic_uri,
+};
+use crate::language_ui::{
+    AnalysisRevealBatch, AnalysisRevealLatch, AnalysisRevealScope, CapturedDefinitionIntent,
+    EditorCaret, LanguageUiState, SelectionIdentity,
+};
 use crate::{
-    ActivationId, AppModel, BindingScope, BoundedTextBuffer, DocumentStamp, EditorSourceKey,
-    ExecutionViewState, FileFailureKind, MarkerInputs, MarkerKind, MarkerMask, MarkerPlan,
-    MarkerSpan, ModelEffect, ModelEvent, ModelStatus, NavigationGeneration, PresentedBinding,
-    PresentedValue, PresentedValueState, RequestId, RuntimeCoordinator, RuntimeDispatchError,
-    SnapshotKey, SourceGrowthLimit, SourceMapper, SupervisorConfig, SupervisorModelEvent, UiAction,
-    ValuePath, apply_event, build_layout_job, escape_display_text, frame_accessible_name,
-    gutter_digits, present_binding, snapshot_accessible_name, snapshot_provenance_label,
+    ActivationId, AppModel, BindingScope, BoundedTextBuffer, DocumentMarkerInputs, DocumentRange,
+    DocumentStamp, EditorSourceKey, ExecutionViewState, FileFailureKind, MarkerKind, MarkerMask,
+    MarkerSpan, ModelEffect, ModelEvent, ModelStatus, NavigationGeneration, PreparedLayoutPlan,
+    PreparedSyntaxRun, PresentedBinding, PresentedValue, PresentedValueState, RequestId,
+    RuntimeCoordinator, RuntimeDispatchError, SnapshotKey, SourceGrowthLimit, SourceMapper,
+    SupervisorConfig, SupervisorModelEvent, SyntaxClass, UiAction, ValuePath, apply_event,
+    build_prepared_layout_job, escape_display_text, frame_accessible_name, gutter_digits,
+    present_binding, snapshot_accessible_name, snapshot_provenance_label,
 };
 
 const MAX_PENDING_EVENTS_PER_PASS: usize = 32;
@@ -28,7 +39,7 @@ const MAX_ADAPTER_EVENTS_PER_PASS: usize = 32;
 const MAX_EFFECTS_PER_PASS: usize = 32;
 const ADAPTER_RETRY_DELAY: Duration = Duration::from_millis(4);
 pub const APP_NAME: &str = "Oxide IDE";
-const SHORTCUT_PRIORITY: [AppAction; 11] = [
+const SHORTCUT_PRIORITY: [AppAction; 12] = [
     AppAction::SaveAs,
     AppAction::Save,
     AppAction::Run,
@@ -40,6 +51,7 @@ const SHORTCUT_PRIORITY: [AppAction; 11] = [
     AppAction::New,
     AppAction::Open,
     AppAction::StepOver,
+    AppAction::GoToDefinition,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -58,12 +70,14 @@ pub enum AppAction {
     StepOver,
     StepOut,
     Stop,
+    GoToDefinition,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionSection {
     File,
     Debug,
+    Navigate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,22 +91,23 @@ pub struct ActionSpec {
 }
 
 impl AppAction {
-    pub fn ui_action(self) -> UiAction {
+    pub fn ui_action(self) -> Option<UiAction> {
         match self {
-            Self::New => UiAction::New,
-            Self::Open => UiAction::Open,
-            Self::Save => UiAction::Save,
-            Self::SaveAs => UiAction::SaveAs,
-            Self::CloseDocument => UiAction::CloseDocument,
-            Self::Exit => UiAction::RequestExit,
-            Self::Run => UiAction::Run,
-            Self::Debug => UiAction::Debug,
-            Self::Pause => UiAction::Pause,
-            Self::Continue => UiAction::Continue,
-            Self::StepInto => UiAction::StepInto,
-            Self::StepOver => UiAction::StepOver,
-            Self::StepOut => UiAction::StepOut,
-            Self::Stop => UiAction::Stop,
+            Self::New => Some(UiAction::New),
+            Self::Open => Some(UiAction::Open),
+            Self::Save => Some(UiAction::Save),
+            Self::SaveAs => Some(UiAction::SaveAs),
+            Self::CloseDocument => Some(UiAction::CloseDocument),
+            Self::Exit => Some(UiAction::RequestExit),
+            Self::Run => Some(UiAction::Run),
+            Self::Debug => Some(UiAction::Debug),
+            Self::Pause => Some(UiAction::Pause),
+            Self::Continue => Some(UiAction::Continue),
+            Self::StepInto => Some(UiAction::StepInto),
+            Self::StepOver => Some(UiAction::StepOver),
+            Self::StepOut => Some(UiAction::StepOut),
+            Self::Stop => Some(UiAction::Stop),
+            Self::GoToDefinition => None,
         }
     }
 }
@@ -100,16 +115,26 @@ impl AppAction {
 pub struct OxideApp {
     model: AppModel,
     backend: AppBackend,
+    language: LanguageUiState,
+    analysis_reveal_latch: AnalysisRevealLatch,
+    pending_definition: Option<CapturedDefinitionIntent>,
+    pending_analysis_click: Option<PendingAnalysisClick>,
+    handled_definition: Option<DefinitionResultId>,
+    handled_notices: Vec<NoticeId>,
+    language_process: Option<ProcessGeneration>,
+    language_notice: Option<String>,
+    language_error: Option<String>,
     queued_events: VecDeque<ModelEvent>,
     deferred_actions: VecDeque<AppAction>,
     deferred_ui_actions: VecDeque<UiAction>,
     next_navigation_generation: Option<NavigationGeneration>,
+    highest_navigation_intent: Option<NavigationGeneration>,
+    navigation_target: Option<NavigationTarget>,
     pending_effects: VecDeque<ModelEffect>,
     editor_text: String,
     editor_stamp: Option<DocumentStamp>,
     editor_mapper: Option<SourceMapper>,
     editor_cursor_range: Option<CCursorRange>,
-    pending_navigation: Option<MarkerSpan>,
     navigation_focus_pending: bool,
     editor_notice: Option<String>,
     input_text: String,
@@ -128,6 +153,33 @@ pub struct OxideApp {
     allow_native_close: bool,
     native_close_pending: bool,
     native_close_request_enqueued: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavigationOrigin {
+    Language {
+        process_generation: crate::language::ProcessGeneration,
+    },
+    Run {
+        binding: crate::RunBinding,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NavigationTarget {
+    navigation_generation: NavigationGeneration,
+    origin: NavigationOrigin,
+    range: DocumentRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingAnalysisClick {
+    navigation_generation: NavigationGeneration,
+    process_generation: ProcessGeneration,
+    stamp: DocumentStamp,
+    diagnostic_revision: DiagnosticSetRevision,
+    item_id: DiagnosticItemId,
+    range: DocumentRange,
 }
 
 enum AppBackend {
@@ -185,6 +237,11 @@ fn load_app_icon() -> eframe::Result<egui::IconData> {
 
 impl OxideApp {
     pub fn headless(model: AppModel) -> Self {
+        Self::headless_with_language(model, LanguageUiState::unavailable())
+    }
+
+    fn headless_with_language(model: AppModel, language: LanguageUiState) -> Self {
+        let language_process = language.snapshot().process_generation();
         let (editor_stamp, editor_text) = model.document().map_or_else(
             || (None, String::new()),
             |document| (Some(document.stamp()), document.text().to_owned()),
@@ -192,16 +249,26 @@ impl OxideApp {
         Self {
             model,
             backend: AppBackend::Headless,
+            language,
+            analysis_reveal_latch: AnalysisRevealLatch::default(),
+            pending_definition: None,
+            pending_analysis_click: None,
+            handled_definition: None,
+            handled_notices: Vec::new(),
+            language_process,
+            language_notice: None,
+            language_error: None,
             queued_events: VecDeque::new(),
             deferred_actions: VecDeque::new(),
             deferred_ui_actions: VecDeque::new(),
             next_navigation_generation: NavigationGeneration::from_raw(1),
+            highest_navigation_intent: None,
+            navigation_target: None,
             pending_effects: VecDeque::new(),
             editor_text,
             editor_stamp,
             editor_mapper: None,
             editor_cursor_range: None,
-            pending_navigation: None,
             navigation_focus_pending: false,
             editor_notice: None,
             input_text: String::new(),
@@ -221,6 +288,14 @@ impl OxideApp {
             native_close_pending: false,
             native_close_request_enqueued: false,
         }
+    }
+
+    #[cfg(test)]
+    fn headless_with_language_port(
+        model: AppModel,
+        port: Box<dyn crate::language_ui::LanguagePort>,
+    ) -> Self {
+        Self::headless_with_language(model, LanguageUiState::new(port))
     }
 
     pub fn native(cc: &eframe::CreationContext<'_>) -> io::Result<Self> {
@@ -248,6 +323,10 @@ impl OxideApp {
             file_context.request_repaint();
         })?;
         let mut app = Self::headless(AppModel::new());
+        let language_context = cc.egui_ctx.clone();
+        app.language = LanguageUiState::native(LanguageCoordinator::start(move || {
+            language_context.request_repaint();
+        }));
         app.backend = AppBackend::Native {
             runtime,
             files,
@@ -260,7 +339,7 @@ impl OxideApp {
         &self.model
     }
 
-    pub fn action_catalog(&self) -> [ActionSpec; 14] {
+    pub fn action_catalog(&self) -> [ActionSpec; 15] {
         let execution = self.model.controls();
         let file = self.model.file_controls();
         let runtime_available = !self.runtime_disconnect_reported;
@@ -377,12 +456,25 @@ impl OxideApp {
                 execution.stop && runtime_available,
                 true,
             ),
+            action(
+                AppAction::GoToDefinition,
+                ActionSection::Navigate,
+                "Go to Definition",
+                key(Key::F12),
+                !self.language.caret_exhausted() && self.language.definition_available(),
+                false,
+            ),
         ]
     }
 
     pub fn queue_action(&mut self, action: AppAction) {
-        self.queued_events
-            .push_back(ModelEvent::Ui(action.ui_action()));
+        if action == AppAction::GoToDefinition {
+            self.capture_definition_action();
+            return;
+        }
+        if let Some(action) = action.ui_action() {
+            self.queued_events.push_back(ModelEvent::Ui(action));
+        }
     }
 
     pub fn queue_event(&mut self, event: ModelEvent) {
@@ -414,8 +506,11 @@ impl OxideApp {
             ) {
                 self.runtime_disconnect_reported = true;
             }
-            self.pending_effects
-                .extend(apply_event(&mut self.model, event));
+            let effects = apply_event(&mut self.model, event);
+            for effect in &effects {
+                self.stage_local_effect(effect);
+            }
+            self.pending_effects.extend(effects);
             let revealed_problem = self.model.problems().len() > previous_problem_count
                 || self.model.problems_were_truncated() && !previous_problems_truncated
                 || self.model.execution_state() == ExecutionViewState::Faulted
@@ -454,6 +549,11 @@ impl OxideApp {
     }
 
     fn defer_action(&mut self, ctx: &egui::Context, action: AppAction) {
+        if action == AppAction::GoToDefinition {
+            self.capture_definition_action();
+            ctx.request_repaint();
+            return;
+        }
         self.deferred_actions.push_back(action);
         ctx.request_repaint();
     }
@@ -466,7 +566,309 @@ impl OxideApp {
     fn allocate_navigation_generation(&mut self) -> Option<NavigationGeneration> {
         let generation = self.next_navigation_generation?;
         self.next_navigation_generation = generation.checked_next();
+        self.highest_navigation_intent = Some(generation);
+        self.navigation_target = None;
+        self.navigation_focus_pending = false;
         Some(generation)
+    }
+
+    fn install_navigation_target(
+        &mut self,
+        navigation_generation: NavigationGeneration,
+        origin: NavigationOrigin,
+        range: DocumentRange,
+    ) -> bool {
+        if self.highest_navigation_intent != Some(navigation_generation) {
+            return false;
+        }
+        let Some(document) = self.model.document() else {
+            return false;
+        };
+        if range.document != document.stamp() || self.editor_text != document.text() {
+            return false;
+        }
+        let mapper = SourceMapper::for_document(document.stamp(), document.text());
+        if mapper.map_document_range(&range).is_err() {
+            return false;
+        }
+        self.navigation_target = Some(NavigationTarget {
+            navigation_generation,
+            origin,
+            range,
+        });
+        self.navigation_focus_pending = true;
+        true
+    }
+
+    fn capture_definition_action(&mut self) {
+        let Some(generation) = self.allocate_navigation_generation() else {
+            return;
+        };
+        self.pending_definition = self.language.capture_definition(generation);
+    }
+
+    fn current_editor_caret(&self) -> Option<EditorCaret> {
+        let document = self.model.document()?;
+        if self.editor_stamp != Some(document.stamp()) || self.editor_text != document.text() {
+            return None;
+        }
+        let (primary_character, selection) =
+            self.editor_cursor_range.map_or((None, None), |range| {
+                let primary = range.primary.index.0;
+                let secondary = range.secondary.index.0;
+                (
+                    Some(primary),
+                    Some(SelectionIdentity {
+                        anchor_character: secondary,
+                        focus_character: primary,
+                    }),
+                )
+            });
+        Some(EditorCaret {
+            stamp: document.stamp(),
+            primary_character,
+            selection,
+        })
+    }
+
+    fn reconcile_language(&mut self, ctx: &egui::Context) {
+        let document = self.model.document();
+        let caret = self.current_editor_caret();
+        let mut closed = false;
+        if self.language.reconcile_document(document).is_err() {
+            closed = true;
+        }
+        let snapshot = self.language.refresh_snapshot();
+        self.reconcile_language_process(snapshot.process_generation());
+        if self.language.reconcile_caret(caret).is_err() {
+            closed = true;
+        }
+        self.observe_analysis_batch(&snapshot);
+        self.apply_pending_analysis_click(&snapshot);
+        self.consume_definition_result(&snapshot);
+        self.consume_language_notices(&snapshot);
+        if let Some(captured) = self.pending_definition.take() {
+            match self.language.submit_definition(captured) {
+                Ok(_) => {}
+                Err(_) => closed = true,
+            }
+        }
+        if self.language.flush_acknowledgements().is_err() {
+            closed = true;
+        }
+        if closed {
+            self.language_error = Some("The language service is unavailable.".to_owned());
+        }
+        if closed || self.pending_definition.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
+    fn reconcile_language_process(&mut self, process_generation: Option<ProcessGeneration>) {
+        if self.language_process == process_generation {
+            return;
+        }
+        self.language_process = process_generation;
+        self.handled_definition = None;
+        self.handled_notices.clear();
+        self.pending_definition = None;
+        self.pending_analysis_click = None;
+        self.language_notice = None;
+        if self
+            .navigation_target
+            .as_ref()
+            .is_some_and(|target| matches!(target.origin, NavigationOrigin::Language { .. }))
+        {
+            self.navigation_target = None;
+            self.navigation_focus_pending = false;
+        }
+    }
+
+    fn analysis_is_current(
+        &self,
+        snapshot: &LanguageSnapshot,
+        diagnostics: &DiagnosticSnapshot,
+    ) -> bool {
+        let Some(document) = self.model.document() else {
+            return false;
+        };
+        let stamp = document.stamp();
+        self.editor_stamp == Some(stamp)
+            && self.editor_text == document.text()
+            && snapshot.process_generation() == Some(diagnostics.process_generation)
+            && snapshot.desired_stamp() == Some(stamp)
+            && snapshot.written_document().is_some_and(|written| {
+                written.stamp == stamp
+                    && written.uri.as_ref() == diagnostics.uri.as_ref()
+                    && written.lsp_version == Some(diagnostics.lsp_version)
+            })
+            && diagnostics.stamp == stamp
+            && diagnostics.uri.as_ref() == synthetic_uri(stamp.document_id)
+    }
+
+    fn observe_analysis_batch(&mut self, snapshot: &LanguageSnapshot) {
+        let current_scope = self.model.document().and_then(|document| {
+            snapshot
+                .process_generation()
+                .map(|process_generation| AnalysisRevealScope {
+                    document: document.stamp().document_id,
+                    process_generation,
+                })
+        });
+        let accepted_batch = snapshot.diagnostics().and_then(|diagnostics| {
+            self.analysis_is_current(snapshot, diagnostics)
+                .then_some(AnalysisRevealBatch {
+                    scope: AnalysisRevealScope {
+                        document: diagnostics.stamp.document_id,
+                        process_generation: diagnostics.process_generation,
+                    },
+                    revision: diagnostics.revision,
+                    item_count: diagnostics.items.len(),
+                })
+        });
+        if self
+            .analysis_reveal_latch
+            .observe(current_scope, accepted_batch)
+        {
+            self.console_tab = ConsoleTab::Problems;
+            self.console_expanded = true;
+        }
+    }
+
+    fn apply_pending_analysis_click(&mut self, snapshot: &LanguageSnapshot) {
+        let Some(click) = self.pending_analysis_click.take() else {
+            return;
+        };
+        let valid = snapshot.diagnostics().is_some_and(|diagnostics| {
+            self.analysis_is_current(snapshot, diagnostics)
+                && diagnostics.process_generation == click.process_generation
+                && diagnostics.stamp == click.stamp
+                && diagnostics.revision == click.diagnostic_revision
+                && diagnostics.items.iter().any(|item| {
+                    item.id == click.item_id
+                        && item.range.as_ref().is_some_and(|range| {
+                            range.bytes == click.range.byte_range
+                                && range.characters.start == click.range.char_range.start.0
+                                && range.characters.end == click.range.char_range.end.0
+                        })
+                })
+        });
+        if valid {
+            self.install_navigation_target(
+                click.navigation_generation,
+                NavigationOrigin::Language {
+                    process_generation: click.process_generation,
+                },
+                click.range,
+            );
+        }
+    }
+
+    fn consume_definition_result(&mut self, snapshot: &LanguageSnapshot) {
+        let Some(definition) = snapshot.definition() else {
+            return;
+        };
+        if self.handled_definition == Some(definition.id) {
+            return;
+        }
+        self.handled_definition = Some(definition.id);
+        let current_document = self.model.document().map(|document| document.stamp());
+        let fence_matches = current_document == Some(definition.stamp)
+            && self.editor_stamp == current_document
+            && self.model.document().is_some_and(|document| {
+                self.editor_text == document.text()
+                    && definition.uri.as_ref() == synthetic_uri(document.stamp().document_id)
+            })
+            && snapshot.process_generation() == Some(definition.process_generation)
+            && snapshot.desired_stamp() == Some(definition.stamp)
+            && snapshot.written_document().is_some_and(|written| {
+                written.stamp == definition.stamp
+                    && written.uri.as_ref() == definition.uri.as_ref()
+                    && written.lsp_version == Some(definition.lsp_version)
+            })
+            && self.language.definition_result_current(definition)
+            && self.highest_navigation_intent == Some(definition.navigation_generation);
+        if fence_matches {
+            if let Some(target) = definition.targets.first() {
+                let range = DocumentRange::new(
+                    definition.stamp,
+                    target.range.bytes.clone(),
+                    CharIndex(target.range.characters.start)
+                        ..CharIndex(target.range.characters.end),
+                );
+                self.install_navigation_target(
+                    definition.navigation_generation,
+                    NavigationOrigin::Language {
+                        process_generation: definition.process_generation,
+                    },
+                    range,
+                );
+                if definition.targets.len() > 1 {
+                    self.language_notice = Some(format!(
+                        "{} definitions found; showing the first.",
+                        definition.targets.len()
+                    ));
+                }
+            } else {
+                self.language_notice = Some("No definition was found.".to_owned());
+            }
+        }
+        self.language.acknowledge_definition(definition.id);
+    }
+
+    fn consume_language_notices(&mut self, snapshot: &LanguageSnapshot) {
+        self.handled_notices
+            .retain(|id| snapshot.notices().iter().any(|notice| notice.id == *id));
+        for notice in snapshot.notices() {
+            if self.handled_notices.contains(&notice.id) {
+                continue;
+            }
+            self.language_notice = Some(notice.message.to_string());
+            self.handled_notices.push(notice.id);
+            self.language.acknowledge_notice(notice.id);
+        }
+    }
+
+    fn stage_local_effect(&mut self, effect: &ModelEffect) {
+        let ModelEffect::Navigate {
+            navigation_generation,
+            document,
+            run,
+            span,
+        } = effect
+        else {
+            return;
+        };
+        let Some(current_document) = self.model.document() else {
+            return;
+        };
+        if current_document.stamp() != *document || self.editor_text != current_document.text() {
+            return;
+        }
+        let provenance_is_current = self.model.active_run() == Some(*run)
+            || self
+                .model
+                .retained_snapshot()
+                .is_some_and(|snapshot| snapshot.document() == *document && snapshot.run() == *run)
+            || self.model.problems().iter().any(|problem| {
+                problem.document() == *document
+                    && problem.run() == *run
+                    && problem.diagnostic().span == **span
+            });
+        if !provenance_is_current {
+            return;
+        }
+        let mapper = SourceMapper::for_document(*document, current_document.text());
+        let key = EditorSourceKey::new(*document, *run);
+        let marker = MarkerSpan::new(key, **span);
+        let Ok(range) = mapper.map_run_range(key, marker) else {
+            return;
+        };
+        self.install_navigation_target(
+            *navigation_generation,
+            NavigationOrigin::Run { binding: *run },
+            range,
+        );
     }
 
     fn flush_deferred_actions(&mut self, ctx: &egui::Context) {
@@ -478,7 +880,8 @@ impl OxideApp {
         self.queued_events.extend(
             self.deferred_actions
                 .drain(..)
-                .map(|action| ModelEvent::Ui(action.ui_action())),
+                .filter_map(AppAction::ui_action)
+                .map(ModelEvent::Ui),
         );
         ctx.request_repaint();
     }
@@ -716,16 +1119,10 @@ impl OxideApp {
                 }
                 ModelEffect::Navigate {
                     navigation_generation: _,
-                    document,
-                    run,
-                    span,
-                } => {
-                    self.pending_navigation = Some(MarkerSpan::new(
-                        crate::EditorSourceKey::new(document, run),
-                        *span,
-                    ));
-                    self.navigation_focus_pending = true;
-                }
+                    document: _,
+                    run: _,
+                    span: _,
+                } => {}
                 ModelEffect::AuthorizeClose { .. } => {
                     self.allow_native_close = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -797,7 +1194,8 @@ impl OxideApp {
         ));
     }
 
-    fn shutdown_backend(&self) {
+    fn shutdown_backend(&mut self) {
+        self.language.request_shutdown();
         if let AppBackend::Native { runtime, .. } = &self.backend {
             runtime.shutdown();
         }
@@ -823,6 +1221,17 @@ impl OxideApp {
                     for spec in catalog
                         .iter()
                         .filter(|spec| spec.section == ActionSection::Debug)
+                    {
+                        if action_menu_item(ui, *spec) {
+                            chosen = Some(spec.action);
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Navigate", |ui| {
+                    for spec in catalog
+                        .iter()
+                        .filter(|spec| spec.section == ActionSection::Navigate)
                     {
                         if action_menu_item(ui, *spec) {
                             chosen = Some(spec.action);
@@ -902,6 +1311,14 @@ impl OxideApp {
                     ui.separator();
                     ui.colored_label(Color32::from_rgb(164, 42, 42), message);
                 }
+                ui.separator();
+                ui.label(format!(
+                    "Language: {}",
+                    language_status_label(self.language.snapshot().status())
+                ));
+                if let Some(message) = self.language_error.as_deref() {
+                    ui.colored_label(Color32::from_rgb(164, 42, 42), message);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label("UTF-8  •  LF");
                 });
@@ -916,6 +1333,14 @@ impl OxideApp {
                 .as_ref()
                 .is_some_and(|pending| self.input_submitted_for != Some(pending.request_id));
         let mut selected_problem = None;
+        let snapshot = Arc::clone(self.language.snapshot());
+        let analysis = snapshot
+            .diagnostics()
+            .filter(|diagnostics| self.analysis_is_current(&snapshot, diagnostics))
+            .cloned();
+        let language_status = snapshot.status();
+        let stderr_tail = snapshot.stderr_tail().cloned();
+        let mut selected_analysis = None;
         let mut submitted_input = None;
         Panel::bottom("oxide_console")
             .default_size(190.0)
@@ -989,8 +1414,85 @@ impl OxideApp {
                             }
                         }
                         ConsoleTab::Problems => {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Analysis").strong());
+                                if analysis.is_none() {
+                                    ui.small(match language_status {
+                                        LanguageStatus::Unavailable | LanguageStatus::Disabled => {
+                                            "Unavailable"
+                                        }
+                                        LanguageStatus::Starting | LanguageStatus::Initializing => {
+                                            "Starting"
+                                        }
+                                        LanguageStatus::ShuttingDown => "Shutting down",
+                                        LanguageStatus::Ready | LanguageStatus::Limited => {
+                                            "Waiting for current document"
+                                        }
+                                    });
+                                }
+                            });
+                            if let Some(diagnostics) = analysis.as_ref() {
+                                if diagnostics.items.is_empty() {
+                                    ui.label("No analysis problems.");
+                                }
+                                for item in diagnostics.items.iter() {
+                                    let mut label = format!(
+                                        "{} {}: {}",
+                                        analysis_severity_label(item.severity),
+                                        item.phase.map_or("analysis", analysis_phase_label),
+                                        escape_display_text(&item.message),
+                                    );
+                                    if let Some(code) = item.code.as_deref() {
+                                        let _ = write!(label, " [{code}]");
+                                    }
+                                    if let Some(source) = item.source.as_deref() {
+                                        let _ = write!(label, " ({source})");
+                                    }
+                                    if let Some(range) = item.range.as_ref() {
+                                        let _ = write!(
+                                            label,
+                                            " — characters {}–{}",
+                                            range.characters.start, range.characters.end
+                                        );
+                                        if ui.add(Button::new(label)).clicked() {
+                                            selected_analysis = Some((
+                                                diagnostics.process_generation,
+                                                diagnostics.stamp,
+                                                diagnostics.revision,
+                                                item.id,
+                                                DocumentRange::new(
+                                                    diagnostics.stamp,
+                                                    range.bytes.clone(),
+                                                    CharIndex(range.characters.start)
+                                                        ..CharIndex(range.characters.end),
+                                                ),
+                                            ));
+                                        }
+                                    } else {
+                                        ui.label(label);
+                                    }
+                                    if item.local_limit {
+                                        ui.small("This local limit item has no source location.");
+                                    }
+                                }
+                            }
+                            if let Some(stderr) = stderr_tail.as_ref() {
+                                ui.collapsing("Language service details", |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(stderr.text.as_ref()).monospace(),
+                                        )
+                                        .selectable(true),
+                                    );
+                                    if stderr.truncated {
+                                        ui.small("Earlier language-service output was omitted.");
+                                    }
+                                });
+                            }
+                            ui.separator();
+                            ui.label(RichText::new("Run").strong());
                             if self.model.problems().is_empty() {
-                                ui.label("No problems.");
+                                ui.label("No run problems.");
                             } else {
                                 for problem in self.model.problems() {
                                     let diagnostic = problem.diagnostic();
@@ -1024,6 +1526,19 @@ impl OxideApp {
                         }
                     });
             });
+        if let Some((process_generation, stamp, revision, item_id, range)) = selected_analysis
+            && let Some(navigation_generation) = self.allocate_navigation_generation()
+        {
+            self.pending_analysis_click = Some(PendingAnalysisClick {
+                navigation_generation,
+                process_generation,
+                stamp,
+                diagnostic_revision: revision,
+                item_id,
+                range,
+            });
+            ui.ctx().request_repaint();
+        }
         if let Some(problem_id) = selected_problem
             && let Some(navigation_generation) = self.allocate_navigation_generation()
         {
@@ -1088,88 +1603,128 @@ impl OxideApp {
         }
     }
 
-    fn editor_marker_plan(&mut self) -> Option<(MarkerPlan, Option<crate::MappedSpan>)> {
-        let document = self.model.document()?;
-        let document_stamp = document.stamp();
+    fn editor_layout_plan(&mut self) -> (Option<PreparedLayoutPlan>, Option<crate::MappedSpan>) {
+        let Some(document) = self.model.document() else {
+            self.editor_mapper = None;
+            return (None, None);
+        };
         if self.editor_text != document.text() {
-            return None;
+            self.editor_mapper = None;
+            return (None, None);
         }
-        let navigation_is_current = self.pending_navigation.is_none_or(|navigation| {
-            navigation.source.document == document_stamp
-                && (self.model.active_run() == Some(navigation.source.run)
-                    || self.model.retained_snapshot().is_some_and(|snapshot| {
-                        snapshot.document() == document_stamp
-                            && snapshot.run() == navigation.source.run
-                    })
-                    || self.model.problems().iter().any(|problem| {
-                        problem.document() == document_stamp
-                            && problem.run() == navigation.source.run
-                            && problem.diagnostic().span == navigation.span
-                    }))
-        });
-        if !navigation_is_current {
-            self.pending_navigation = None;
-            self.navigation_focus_pending = false;
+        let document_stamp = document.stamp();
+        if self
+            .editor_mapper
+            .as_ref()
+            .is_none_or(|mapper| mapper.document() != document_stamp || mapper.run_key().is_some())
+        {
+            self.editor_mapper = Some(SourceMapper::for_document(document_stamp, document.text()));
         }
-
+        let mapper = self
+            .editor_mapper
+            .as_ref()
+            .expect("current document mapper was initialized");
         let retained_source = self
             .model
             .retained_snapshot()
             .filter(|snapshot| snapshot.document() == document_stamp)
             .map(|snapshot| EditorSourceKey::new(snapshot.document(), snapshot.run()));
-        let active_source = self
-            .model
-            .active_run()
-            .map(|run| EditorSourceKey::new(document_stamp, run));
-        let source = self
-            .pending_navigation
-            .map(|navigation| navigation.source)
-            .or(retained_source)
-            .or(active_source)?;
-        if self
-            .editor_mapper
-            .as_ref()
-            .is_none_or(|mapper| mapper.run_key() != Some(source))
-        {
-            self.editor_mapper = Some(SourceMapper::new(source, &self.editor_text));
+        let map_run_span = |source: EditorSourceKey, span| {
+            mapper
+                .map_run_range(source, MarkerSpan::new(source, span))
+                .ok()
+        };
+        let current = retained_source.and_then(|source| {
+            self.model
+                .current_span()
+                .and_then(|span| map_run_span(source, span))
+        });
+        let fault = retained_source.and_then(|source| {
+            self.model
+                .fault_span()
+                .and_then(|span| map_run_span(source, span))
+        });
+
+        let navigation_is_current = self.navigation_target.as_ref().is_some_and(|target| {
+            target.navigation_generation
+                == self
+                    .highest_navigation_intent
+                    .unwrap_or(target.navigation_generation)
+                && target.range.document == document_stamp
+                && match target.origin {
+                    NavigationOrigin::Language { process_generation } => {
+                        self.language.snapshot().process_generation() == Some(process_generation)
+                    }
+                    NavigationOrigin::Run { binding } => {
+                        self.model.active_run() == Some(binding)
+                            || self.model.retained_snapshot().is_some_and(|snapshot| {
+                                snapshot.document() == document_stamp && snapshot.run() == binding
+                            })
+                            || self.model.problems().iter().any(|problem| {
+                                problem.document() == document_stamp && problem.run() == binding
+                            })
+                    }
+                }
+        });
+        if self.navigation_target.is_some() && !navigation_is_current {
+            self.navigation_target = None;
+            self.navigation_focus_pending = false;
         }
-        let current = retained_source
-            .filter(|retained| *retained == source)
-            .and_then(|retained| {
-                self.model
-                    .current_span()
-                    .map(|span| MarkerSpan::new(retained, span))
-            });
-        let fault = retained_source
-            .filter(|retained| *retained == source)
-            .and_then(|retained| {
-                self.model
-                    .fault_span()
-                    .map(|span| MarkerSpan::new(retained, span))
-            });
         let navigation = self
-            .pending_navigation
-            .filter(|navigation| navigation.source == source);
-        let mapper = self.editor_mapper.as_ref().expect("mapper was initialized");
-        let plan = mapper.resolve_markers(MarkerInputs {
+            .navigation_target
+            .as_ref()
+            .map(|target| target.range.clone());
+        let markers = mapper.resolve_document_markers(DocumentMarkerInputs {
             current,
             fault,
-            navigation,
+            navigation: navigation.clone(),
         });
-        let focus = if self.navigation_focus_pending {
-            navigation.and_then(|marker| mapper.map_span(marker).ok())
-        } else {
-            None
-        };
+
+        let snapshot = self.language.snapshot();
+        let syntax = snapshot.syntax().filter(|syntax| {
+            snapshot.process_generation() == Some(syntax.process_generation)
+                && snapshot.desired_stamp() == Some(document_stamp)
+                && snapshot.written_document().is_some_and(|written| {
+                    written.stamp == document_stamp
+                        && written.uri.as_ref() == syntax.uri.as_ref()
+                        && written.lsp_version == Some(syntax.lsp_version)
+                })
+                && syntax.stamp == document_stamp
+                && syntax.uri.as_ref() == synthetic_uri(document_stamp.document_id)
+        });
+        let prepared_syntax = syntax.map_or_else(Vec::new, |syntax| {
+            syntax
+                .runs
+                .iter()
+                .map(|run| {
+                    PreparedSyntaxRun::new(
+                        DocumentRange::new(
+                            document_stamp,
+                            run.range.bytes.clone(),
+                            CharIndex(run.range.characters.start)
+                                ..CharIndex(run.range.characters.end),
+                        ),
+                        syntax_class(run.kind),
+                    )
+                })
+                .collect()
+        });
+        let plan = PreparedLayoutPlan::compose(mapper, &markers, &prepared_syntax);
+        let focus = self
+            .navigation_focus_pending
+            .then_some(navigation.as_ref())
+            .flatten()
+            .and_then(|range| mapper.map_document_range(range).ok());
         if self.navigation_focus_pending && focus.is_none() {
             self.navigation_focus_pending = false;
             self.editor_notice = Some("That source location is no longer available.".to_owned());
         }
-        Some((plan, focus))
+        (Some(plan), focus)
     }
 
     fn show_editor(&mut self, ui: &mut egui::Ui) {
-        let marker_state = self.editor_marker_plan();
+        let layout_state = self.editor_layout_plan();
+        let layout_source = self.model.document().map(|document| document.shared_text());
         CentralPanel::default().show(ui, |ui| {
             let heading = self.model.document().map_or_else(
                 || "No document".to_owned(),
@@ -1182,6 +1737,9 @@ impl OxideApp {
             if let Some(notice) = self.editor_notice.as_deref() {
                 ui.colored_label(Color32::from_rgb(164, 42, 42), notice);
             }
+            if let Some(notice) = self.language_notice.as_deref() {
+                ui.colored_label(Color32::from_rgb(82, 72, 25), notice);
+            }
             ui.separator();
             let source_label = ui.label("Source editor");
             let editor_id = egui::Id::new("oxide_source_editor").with(
@@ -1189,10 +1747,9 @@ impl OxideApp {
                     .map(|stamp| stamp.document_id.get())
                     .unwrap_or_default(),
             );
-            let (marker_plan, navigation) = marker_state
-                .as_ref()
-                .map_or((None, None), |(plan, navigation)| (Some(plan), *navigation));
-            ui.small(marker_summary(marker_plan));
+            let (layout_plan, navigation) = layout_state;
+            let layout_plan = layout_plan.as_ref();
+            ui.small(marker_summary(layout_plan));
             let editor_size = ui.available_size();
             ScrollArea::vertical()
                 .id_salt((
@@ -1215,7 +1772,7 @@ impl OxideApp {
                             SourceMapper::line_count,
                         );
                         let gutter = egui::Label::new(
-                            RichText::new(gutter_text(line_count, marker_plan)).monospace(),
+                            RichText::new(gutter_text(line_count, layout_plan)).monospace(),
                         )
                         .selectable(false);
                         let (gutter_position, gutter_galley, gutter_response) =
@@ -1249,14 +1806,19 @@ impl OxideApp {
                                     |layout_ui: &egui::Ui,
                                      buffer: &dyn egui::TextBuffer,
                                      _wrap_width: f32| {
-                                        if let Some(plan) = marker_plan {
-                                            let job = build_layout_job(
-                                                buffer.as_str(),
-                                                plan,
-                                                |markers| {
-                                                    marker_text_format(layout_ui, markers)
-                                                },
-                                            );
+                                        if let Some(job) = current_prepared_layout_job(
+                                            self.editor_stamp,
+                                            layout_source.as_ref(),
+                                            buffer.as_str(),
+                                            layout_plan,
+                                            |syntax, markers| {
+                                                prepared_text_format(
+                                                    layout_ui,
+                                                    syntax,
+                                                    markers,
+                                                )
+                                            },
+                                        ) {
                                             layout_ui.painter().layout_job(job)
                                         } else {
                                             layout_ui.painter().layout_no_wrap(
@@ -1336,7 +1898,20 @@ impl OxideApp {
                                         None,
                                     ));
                                 }
-                                if let Some(span) = navigation {
+                                let prepared_source_is_current =
+                                    prepared_editor_source_is_current(
+                                        layout_source.as_ref(),
+                                        self.editor_text.as_str(),
+                                    );
+                                let navigation_input_is_current =
+                                    prepared_source_is_current && !cursor_changed;
+                                if !navigation_input_is_current && navigation.is_some() {
+                                    self.navigation_target = None;
+                                    self.navigation_focus_pending = false;
+                                }
+                                if navigation_input_is_current
+                                    && let Some(span) = navigation
+                                {
                                     let range = span.egui_cursor_range();
                                     output.state.cursor.set_char_range(Some(range));
                                     output.state.store(ui.ctx(), response.id);
@@ -1386,8 +1961,9 @@ impl eframe::App for OxideApp {
                 self.native_close_request_enqueued = false;
             }
         }
-        self.consume_shortcut(ctx);
         self.reduce_pending_events(ctx);
+        self.reconcile_language(ctx);
+        self.consume_shortcut(ctx);
         self.dispatch_native_effects(ctx, frame);
     }
 
@@ -1575,7 +2151,7 @@ fn show_presented_children(ui: &mut egui::Ui, value: &PresentedValue) {
     }
 }
 
-fn gutter_text(line_count: usize, plan: Option<&MarkerPlan>) -> String {
+fn gutter_text(line_count: usize, plan: Option<&PreparedLayoutPlan>) -> String {
     let digits = gutter_digits(line_count);
     let mut text = String::with_capacity(line_count.saturating_mul(digits.saturating_add(4)));
     for line_index in 0..line_count {
@@ -1600,7 +2176,7 @@ fn gutter_text(line_count: usize, plan: Option<&MarkerPlan>) -> String {
     text
 }
 
-fn marker_summary(plan: Option<&MarkerPlan>) -> String {
+fn marker_summary(plan: Option<&PreparedLayoutPlan>) -> String {
     let Some(plan) = plan else {
         return "Line numbers. No active source markers.".to_owned();
     };
@@ -1654,6 +2230,57 @@ fn marker_text_format(ui: &egui::Ui, markers: MarkerMask) -> egui::TextFormat {
     format
 }
 
+fn syntax_class(kind: SyntaxKind) -> SyntaxClass {
+    match kind {
+        SyntaxKind::Keyword => SyntaxClass::Keyword,
+        SyntaxKind::Comment => SyntaxClass::Comment,
+        SyntaxKind::String => SyntaxClass::String,
+        SyntaxKind::Number => SyntaxClass::Number,
+        SyntaxKind::Variable => SyntaxClass::Variable,
+        SyntaxKind::Operator => SyntaxClass::Operator,
+    }
+}
+
+fn prepared_editor_source_is_current(planned_source: Option<&Arc<str>>, editor_text: &str) -> bool {
+    planned_source.is_some_and(|planned_source| planned_source.as_ref() == editor_text)
+}
+
+fn current_prepared_layout_job(
+    document: Option<DocumentStamp>,
+    planned_source: Option<&Arc<str>>,
+    editor_text: &str,
+    plan: Option<&PreparedLayoutPlan>,
+    format_for: impl FnMut(Option<SyntaxClass>, MarkerMask) -> egui::text::TextFormat,
+) -> Option<egui::text::LayoutJob> {
+    if !prepared_editor_source_is_current(planned_source, editor_text) {
+        return None;
+    }
+    Some(build_prepared_layout_job(
+        document?,
+        editor_text,
+        plan?,
+        format_for,
+    ))
+}
+
+fn prepared_text_format(
+    ui: &egui::Ui,
+    syntax: Option<SyntaxClass>,
+    markers: MarkerMask,
+) -> egui::TextFormat {
+    let mut format = marker_text_format(ui, markers);
+    format.color = match syntax {
+        Some(SyntaxClass::Keyword) => Color32::from_rgb(94, 53, 177),
+        Some(SyntaxClass::Comment) => Color32::from_rgb(82, 112, 82),
+        Some(SyntaxClass::String) => Color32::from_rgb(172, 67, 31),
+        Some(SyntaxClass::Number) => Color32::from_rgb(24, 99, 160),
+        Some(SyntaxClass::Variable) => Color32::from_rgb(35, 55, 79),
+        Some(SyntaxClass::Operator) => Color32::from_rgb(86, 86, 86),
+        None => ui.visuals().text_color(),
+    };
+    format
+}
+
 fn phase_label(phase: rlox_protocol::DiagnosticPhase) -> &'static str {
     match phase {
         rlox_protocol::DiagnosticPhase::Scanner => "scanner",
@@ -1668,6 +2295,37 @@ fn severity_label(severity: rlox_protocol::DiagnosticSeverity) -> &'static str {
     match severity {
         rlox_protocol::DiagnosticSeverity::Error => "Error",
         rlox_protocol::DiagnosticSeverity::Warning => "Warning",
+    }
+}
+
+fn analysis_phase_label(phase: AnalysisPhase) -> &'static str {
+    match phase {
+        AnalysisPhase::Scanner => "scanner",
+        AnalysisPhase::Parser => "parser",
+        AnalysisPhase::Compiler => "compiler",
+        AnalysisPhase::Runtime => "runtime",
+        AnalysisPhase::Worker => "worker",
+    }
+}
+
+fn analysis_severity_label(severity: AnalysisSeverity) -> &'static str {
+    match severity {
+        AnalysisSeverity::Error => "Error",
+        AnalysisSeverity::Warning => "Warning",
+        AnalysisSeverity::Information => "Information",
+        AnalysisSeverity::Hint => "Hint",
+    }
+}
+
+fn language_status_label(status: LanguageStatus) -> &'static str {
+    match status {
+        LanguageStatus::Starting => "starting",
+        LanguageStatus::Initializing => "initializing",
+        LanguageStatus::Ready => "ready",
+        LanguageStatus::Unavailable => "unavailable",
+        LanguageStatus::ShuttingDown => "shutting down",
+        LanguageStatus::Disabled => "disabled",
+        LanguageStatus::Limited => "limited",
     }
 }
 
@@ -1700,6 +2358,7 @@ fn toolbar_action_visible(spec: ActionSpec) -> bool {
     match spec.section {
         ActionSection::File => true,
         ActionSection::Debug => spec.enabled || spec.action == AppAction::Stop,
+        ActionSection::Navigate => false,
     }
 }
 
@@ -1778,10 +2437,398 @@ fn ctrl_shift(key: Key) -> Option<KeyboardShortcut> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use eframe::egui::text::{CCursor, CharIndex};
+    use egui_kittest::{Harness, kittest::Queryable};
+    use rlox_protocol::{RevisionId, SourceId, SourceSpan, TextPosition};
 
     use super::*;
     use crate::FileModelEvent;
+    use crate::language::{
+        AcknowledgementBatch, AnalysisDiagnostic, AnalysisPhase, CaretCommand, CaretGeneration,
+        DefinitionIntent, DefinitionResultId, DefinitionSnapshot, DefinitionTargetSnapshot,
+        DesiredDocument, DiagnosticItemId, DiagnosticSetRevision, DiagnosticSeverity,
+        DiagnosticSnapshot, DocumentSyncSnapshot, LanguageClosed, LanguageNotice, LanguageSnapshot,
+        LanguageSnapshotDraft, LspVersion, NoticeId, NoticeKind, ProcessGeneration,
+        SnapshotRevision, SyntaxKind, SyntaxRun, SyntaxSnapshot, TextRange, WriterState,
+    };
+    use crate::language_ui::{LanguagePort, unavailable_snapshot};
+
+    #[derive(Default)]
+    struct CapturedLanguageCommands {
+        documents: Vec<Option<DesiredDocument>>,
+        carets: Vec<CaretCommand>,
+        definitions: Vec<DefinitionIntent>,
+        acknowledgements: Vec<AcknowledgementBatch>,
+        shutdowns: usize,
+    }
+
+    struct FakeLanguagePort {
+        snapshot: Arc<Mutex<Arc<LanguageSnapshot>>>,
+        commands: Arc<Mutex<CapturedLanguageCommands>>,
+    }
+
+    struct SequencedLanguagePort {
+        snapshots: Mutex<VecDeque<Arc<LanguageSnapshot>>>,
+        commands: Arc<Mutex<CapturedLanguageCommands>>,
+    }
+
+    impl LanguagePort for FakeLanguagePort {
+        fn load_snapshot(&self) -> Arc<LanguageSnapshot> {
+            Arc::clone(&self.snapshot.lock().expect("snapshot"))
+        }
+
+        fn submit_document(&self, desired: Option<DesiredDocument>) -> Result<(), LanguageClosed> {
+            self.commands
+                .lock()
+                .expect("commands")
+                .documents
+                .push(desired);
+            Ok(())
+        }
+
+        fn submit_caret(&self, command: CaretCommand) -> Result<(), LanguageClosed> {
+            self.commands.lock().expect("commands").carets.push(command);
+            Ok(())
+        }
+
+        fn request_definition(&self, intent: DefinitionIntent) -> Result<(), LanguageClosed> {
+            self.commands
+                .lock()
+                .expect("commands")
+                .definitions
+                .push(intent);
+            Ok(())
+        }
+
+        fn acknowledge_items(&self, batch: AcknowledgementBatch) -> Result<(), LanguageClosed> {
+            self.commands
+                .lock()
+                .expect("commands")
+                .acknowledgements
+                .push(batch);
+            Ok(())
+        }
+
+        fn request_shutdown(&self) {
+            self.commands.lock().expect("commands").shutdowns += 1;
+        }
+    }
+
+    impl LanguagePort for SequencedLanguagePort {
+        fn load_snapshot(&self) -> Arc<LanguageSnapshot> {
+            let mut snapshots = self.snapshots.lock().expect("snapshots");
+            if snapshots.len() > 1 {
+                snapshots.pop_front().expect("nonempty snapshot sequence")
+            } else {
+                Arc::clone(snapshots.front().expect("nonempty snapshot sequence"))
+            }
+        }
+
+        fn submit_document(&self, desired: Option<DesiredDocument>) -> Result<(), LanguageClosed> {
+            self.commands
+                .lock()
+                .expect("commands")
+                .documents
+                .push(desired);
+            Ok(())
+        }
+
+        fn submit_caret(&self, command: CaretCommand) -> Result<(), LanguageClosed> {
+            self.commands.lock().expect("commands").carets.push(command);
+            Ok(())
+        }
+
+        fn request_definition(&self, intent: DefinitionIntent) -> Result<(), LanguageClosed> {
+            self.commands
+                .lock()
+                .expect("commands")
+                .definitions
+                .push(intent);
+            Ok(())
+        }
+
+        fn acknowledge_items(&self, batch: AcknowledgementBatch) -> Result<(), LanguageClosed> {
+            self.commands
+                .lock()
+                .expect("commands")
+                .acknowledgements
+                .push(batch);
+            Ok(())
+        }
+
+        fn request_shutdown(&self) {
+            self.commands.lock().expect("commands").shutdowns += 1;
+        }
+    }
+
+    type SharedLanguageSnapshot = Arc<Mutex<Arc<LanguageSnapshot>>>;
+    type SharedLanguageCommands = Arc<Mutex<CapturedLanguageCommands>>;
+
+    fn app_with_language_capture() -> (OxideApp, SharedLanguageSnapshot, SharedLanguageCommands) {
+        let snapshot = Arc::new(Mutex::new(unavailable_snapshot()));
+        let commands = Arc::new(Mutex::new(CapturedLanguageCommands::default()));
+        let port = FakeLanguagePort {
+            snapshot: Arc::clone(&snapshot),
+            commands: Arc::clone(&commands),
+        };
+        (
+            OxideApp::headless_with_language_port(AppModel::new(), Box::new(port)),
+            snapshot,
+            commands,
+        )
+    }
+
+    fn app_with_language_sequence(
+        snapshots: impl IntoIterator<Item = Arc<LanguageSnapshot>>,
+    ) -> (OxideApp, SharedLanguageCommands) {
+        let snapshots = snapshots.into_iter().collect::<VecDeque<_>>();
+        assert!(!snapshots.is_empty(), "snapshot sequence must not be empty");
+        let commands = Arc::new(Mutex::new(CapturedLanguageCommands::default()));
+        let port = SequencedLanguagePort {
+            snapshots: Mutex::new(snapshots),
+            commands: Arc::clone(&commands),
+        };
+        (
+            OxideApp::headless_with_language_port(AppModel::new(), Box::new(port)),
+            commands,
+        )
+    }
+
+    fn ready_language_snapshot(stamp: DocumentStamp) -> Arc<LanguageSnapshot> {
+        language_snapshot(stamp, None, None)
+    }
+
+    fn language_snapshot(
+        stamp: DocumentStamp,
+        diagnostics: Option<DiagnosticSnapshot>,
+        definition: Option<DefinitionSnapshot>,
+    ) -> Arc<LanguageSnapshot> {
+        language_snapshot_with_syntax(stamp, diagnostics, None, definition)
+    }
+
+    fn language_snapshot_with_syntax(
+        stamp: DocumentStamp,
+        diagnostics: Option<DiagnosticSnapshot>,
+        syntax: Option<SyntaxSnapshot>,
+        definition: Option<DefinitionSnapshot>,
+    ) -> Arc<LanguageSnapshot> {
+        language_snapshot_for_process(
+            stamp,
+            ProcessGeneration::from_raw(1).expect("process"),
+            diagnostics,
+            syntax,
+            definition,
+        )
+    }
+
+    fn language_snapshot_for_process(
+        stamp: DocumentStamp,
+        process_generation: ProcessGeneration,
+        diagnostics: Option<DiagnosticSnapshot>,
+        syntax: Option<SyntaxSnapshot>,
+        definition: Option<DefinitionSnapshot>,
+    ) -> Arc<LanguageSnapshot> {
+        language_snapshot_for_process_with_notices(
+            stamp,
+            process_generation,
+            diagnostics,
+            syntax,
+            definition,
+            Vec::new(),
+        )
+    }
+
+    fn language_snapshot_for_process_with_notices(
+        stamp: DocumentStamp,
+        process_generation: ProcessGeneration,
+        diagnostics: Option<DiagnosticSnapshot>,
+        syntax: Option<SyntaxSnapshot>,
+        definition: Option<DefinitionSnapshot>,
+        notices: Vec<LanguageNotice>,
+    ) -> Arc<LanguageSnapshot> {
+        let uri: Arc<str> = Arc::from(synthetic_uri(stamp.document_id));
+        let sync = DocumentSyncSnapshot {
+            stamp,
+            uri,
+            lsp_version: Some(LspVersion::from_raw(1).expect("version")),
+        };
+        Arc::new(LanguageSnapshot::bounded(LanguageSnapshotDraft {
+            revision: SnapshotRevision::from_raw(2).expect("revision"),
+            process_generation: Some(process_generation),
+            status: LanguageStatus::Ready,
+            desired_document: Some(sync.clone()),
+            written_document: Some(sync),
+            diagnostics,
+            syntax,
+            definition,
+            notices,
+            stderr_tail: None,
+            writer: WriterState::Idle,
+        }))
+    }
+
+    fn definition_result(
+        stamp: DocumentStamp,
+        navigation_generation: NavigationGeneration,
+        targets: &[std::ops::Range<usize>],
+    ) -> DefinitionSnapshot {
+        definition_result_for_process(
+            stamp,
+            ProcessGeneration::from_raw(1).expect("process"),
+            navigation_generation,
+            targets,
+        )
+    }
+
+    fn definition_result_for_process(
+        stamp: DocumentStamp,
+        process_generation: ProcessGeneration,
+        navigation_generation: NavigationGeneration,
+        targets: &[std::ops::Range<usize>],
+    ) -> DefinitionSnapshot {
+        DefinitionSnapshot {
+            id: DefinitionResultId::from_raw(1).expect("definition id"),
+            process_generation,
+            uri: Arc::from(synthetic_uri(stamp.document_id)),
+            stamp,
+            lsp_version: LspVersion::from_raw(1).expect("version"),
+            caret_generation: CaretGeneration::from_raw(1).expect("caret"),
+            navigation_generation,
+            caret_character: 0,
+            targets: targets
+                .iter()
+                .cloned()
+                .map(|range| DefinitionTargetSnapshot {
+                    range: TextRange {
+                        bytes: range.clone(),
+                        characters: range,
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    fn diagnostics(
+        stamp: DocumentStamp,
+        revision: u64,
+        ranges: &[Option<std::ops::Range<usize>>],
+    ) -> DiagnosticSnapshot {
+        DiagnosticSnapshot {
+            process_generation: ProcessGeneration::from_raw(1).expect("process"),
+            uri: Arc::from(synthetic_uri(stamp.document_id)),
+            stamp,
+            lsp_version: LspVersion::from_raw(1).expect("version"),
+            revision: DiagnosticSetRevision::from_raw(revision).expect("diagnostic revision"),
+            items: ranges
+                .iter()
+                .enumerate()
+                .map(|(index, range)| AnalysisDiagnostic {
+                    id: DiagnosticItemId::from_raw(index as u64 + 1).expect("diagnostic id"),
+                    range: range.as_ref().map(|range| TextRange {
+                        bytes: range.clone(),
+                        characters: range.clone(),
+                    }),
+                    severity: DiagnosticSeverity::Error,
+                    phase: Some(AnalysisPhase::Parser),
+                    code: Some(Arc::from("parse.test")),
+                    source: Some(Arc::from("rlox")),
+                    message: Arc::from("problem"),
+                    local_limit: range.is_none(),
+                })
+                .collect(),
+        }
+    }
+
+    fn collapsed_cursor(character: usize) -> CCursorRange {
+        let cursor = CCursor::new(character);
+        CCursorRange {
+            primary: cursor,
+            secondary: cursor,
+            h_pos: None,
+        }
+    }
+
+    fn set_source(app: &mut OxideApp, source: &str) -> DocumentStamp {
+        let stamp = app.model.document().expect("document").stamp();
+        app.queue_event(ModelEvent::Ui(UiAction::Edit {
+            document: stamp,
+            text: source.to_owned(),
+        }));
+        assert_eq!(app.pump_events(1), 1);
+        app.model.document().expect("edited document").stamp()
+    }
+
+    fn language_ready_app(source: &str) -> OxideApp {
+        let (mut app, snapshot, _) = app_with_language_capture();
+        let stamp = set_source(&mut app, source);
+        *snapshot.lock().expect("snapshot") = ready_language_snapshot(stamp);
+        app.reconcile_language(&egui::Context::default());
+        assert_eq!(
+            app.language_process,
+            Some(ProcessGeneration::from_raw(1).expect("process"))
+        );
+        app
+    }
+
+    fn running_app(source: &str) -> (OxideApp, crate::RunBinding) {
+        let mut model = AppModel::new();
+        let stamp = model.document().expect("document").stamp();
+        assert!(
+            apply_event(
+                &mut model,
+                ModelEvent::Ui(UiAction::Edit {
+                    document: stamp,
+                    text: source.to_owned(),
+                }),
+            )
+            .is_empty()
+        );
+        let start = apply_event(&mut model, ModelEvent::Ui(UiAction::Run));
+        let [ModelEffect::Start(intent)] = start.as_slice() else {
+            panic!("run should start");
+        };
+        let run = crate::RunBinding {
+            worker_session_id: crate::WorkerSessionId(1),
+            run_id: crate::RunId(1),
+            source_id: SourceId(1),
+            source_revision: RevisionId(1),
+        };
+        assert!(
+            apply_event(
+                &mut model,
+                ModelEvent::Supervisor(SupervisorModelEvent::Started {
+                    client_start_id: intent.client_start_id,
+                    mode: crate::RunMode::Run,
+                    run,
+                    request_id: RequestId(1),
+                    next_event_sequence: crate::EventSequence(2),
+                }),
+            )
+            .is_empty()
+        );
+        (OxideApp::headless(model), run)
+    }
+
+    fn source_span(run: crate::RunBinding, start: usize, end: usize) -> SourceSpan {
+        SourceSpan {
+            source_id: run.source_id,
+            revision: run.source_revision,
+            start: TextPosition {
+                byte_offset: start,
+                line: 1,
+                column: start + 1,
+            },
+            end: TextPosition {
+                byte_offset: end,
+                line: 1,
+                column: end + 1,
+            },
+        }
+    }
 
     #[test]
     fn navigation_allocator_uses_the_last_generation_once_then_fails_closed() {
@@ -1792,6 +2839,762 @@ mod tests {
         assert_eq!(app.allocate_navigation_generation(), Some(last));
         assert_eq!(app.allocate_navigation_generation(), None);
         assert_eq!(app.allocate_navigation_generation(), None);
+    }
+
+    #[test]
+    fn a_new_navigation_intent_clears_the_old_target_and_rejects_its_delayed_result() {
+        let mut app = OxideApp::headless(AppModel::new());
+        let stamp = set_source(&mut app, "print 1;");
+        let process = crate::language::ProcessGeneration::from_raw(1).expect("process");
+        let first = app.allocate_navigation_generation().expect("first intent");
+        let first_range = crate::DocumentRange::new(stamp, 0..5, CharIndex(0)..CharIndex(5));
+
+        assert!(app.install_navigation_target(
+            first,
+            NavigationOrigin::Language {
+                process_generation: process,
+            },
+            first_range.clone(),
+        ));
+        assert_eq!(
+            app.navigation_target
+                .as_ref()
+                .map(|target| target.range.clone()),
+            Some(first_range.clone())
+        );
+
+        let second = app.allocate_navigation_generation().expect("second intent");
+        assert!(app.navigation_target.is_none());
+        assert!(!app.install_navigation_target(
+            first,
+            NavigationOrigin::Language {
+                process_generation: process,
+            },
+            first_range,
+        ));
+        assert!(app.navigation_target.is_none());
+
+        let second_range = crate::DocumentRange::new(stamp, 6..7, CharIndex(6)..CharIndex(7));
+        assert!(app.install_navigation_target(
+            second,
+            NavigationOrigin::Language {
+                process_generation: process,
+            },
+            second_range.clone(),
+        ));
+        assert_eq!(
+            app.navigation_target
+                .as_ref()
+                .map(|target| target.range.clone()),
+            Some(second_range)
+        );
+    }
+
+    #[test]
+    fn delayed_run_navigation_is_mapped_with_its_real_binding_and_obeys_last_intent_wins() {
+        let (mut app, run) = running_app("print 1;");
+        let stamp = app.model.document().expect("document").stamp();
+        let stale = app.allocate_navigation_generation().expect("stale intent");
+        let current = app
+            .allocate_navigation_generation()
+            .expect("current intent");
+
+        app.stage_local_effect(&ModelEffect::Navigate {
+            navigation_generation: stale,
+            document: stamp,
+            run,
+            span: Box::new(source_span(run, 0, 5)),
+        });
+        assert!(app.navigation_target.is_none());
+
+        app.stage_local_effect(&ModelEffect::Navigate {
+            navigation_generation: current,
+            document: stamp,
+            run,
+            span: Box::new(source_span(run, 0, 5)),
+        });
+        let target = app.navigation_target.as_ref().expect("current target");
+        assert_eq!(target.navigation_generation, current);
+        assert_eq!(target.origin, NavigationOrigin::Run { binding: run });
+        assert_eq!(target.range.document, stamp);
+        assert_eq!(target.range.byte_range, 0..5);
+        assert_eq!(target.range.char_range, CharIndex(0)..CharIndex(5));
+    }
+
+    #[test]
+    fn editor_layout_is_document_scoped_even_without_a_run() {
+        let mut app = OxideApp::headless(AppModel::new());
+        let stamp = app.model.document().expect("document").stamp();
+
+        let (plan, navigation) = app.editor_layout_plan();
+
+        assert_eq!(plan.expect("document layout").document(), stamp);
+        assert!(navigation.is_none());
+        assert_eq!(
+            app.editor_mapper.as_ref().and_then(SourceMapper::run_key),
+            None
+        );
+    }
+
+    #[test]
+    fn app_reconciliation_submits_only_the_reduced_document_arc() {
+        let (mut app, _snapshot, commands) = app_with_language_capture();
+        let initial = app.model.document().expect("document").stamp();
+        app.queue_event(ModelEvent::Ui(UiAction::Edit {
+            document: initial,
+            text: "print 42;".to_owned(),
+        }));
+        assert_eq!(app.pump_events(32), 1);
+        let expected = app.model.document().expect("edited document").shared_text();
+
+        app.reconcile_language(&egui::Context::default());
+        app.reconcile_language(&egui::Context::default());
+
+        let commands = commands.lock().expect("commands");
+        assert_eq!(commands.documents.len(), 1);
+        let desired = commands.documents[0].as_ref().expect("open document");
+        assert!(Arc::ptr_eq(&desired.text, &expected));
+    }
+
+    #[test]
+    fn language_shutdown_is_signal_only_and_idempotent() {
+        let (mut app, _snapshot, commands) = app_with_language_capture();
+
+        app.shutdown_backend();
+        app.shutdown_backend();
+        drop(app);
+
+        assert_eq!(commands.lock().expect("commands").shutdowns, 1);
+    }
+
+    #[test]
+    fn f12_is_submitted_only_after_its_exact_document_and_caret_survive_a_logic_pass() {
+        let (mut app, snapshot, commands) = app_with_language_capture();
+        let stamp = app.model.document().expect("document").stamp();
+        *snapshot.lock().expect("snapshot") = ready_language_snapshot(stamp);
+        app.editor_cursor_range = Some(collapsed_cursor(0));
+        let ctx = egui::Context::default();
+        app.reconcile_language(&ctx);
+        assert!(
+            app.action_catalog()
+                .iter()
+                .any(|spec| { spec.action == AppAction::GoToDefinition && spec.enabled })
+        );
+
+        app.queue_action(AppAction::GoToDefinition);
+        assert!(commands.lock().expect("commands").definitions.is_empty());
+        app.reconcile_language(&ctx);
+
+        assert_eq!(commands.lock().expect("commands").definitions.len(), 1);
+    }
+
+    #[test]
+    fn same_frame_edit_drops_a_captured_f12_before_it_reaches_the_port() {
+        let (mut app, snapshot, commands) = app_with_language_capture();
+        let stamp = app.model.document().expect("document").stamp();
+        *snapshot.lock().expect("snapshot") = ready_language_snapshot(stamp);
+        app.editor_cursor_range = Some(collapsed_cursor(0));
+        let ctx = egui::Context::default();
+        app.reconcile_language(&ctx);
+        app.queue_action(AppAction::GoToDefinition);
+
+        app.queue_event(ModelEvent::Ui(UiAction::Edit {
+            document: stamp,
+            text: "print 1;".to_owned(),
+        }));
+        assert_eq!(app.pump_events(32), 1);
+        app.reconcile_language(&ctx);
+
+        assert!(commands.lock().expect("commands").definitions.is_empty());
+    }
+
+    #[test]
+    fn same_frame_selection_change_drops_a_captured_f12() {
+        let (mut app, snapshot, commands) = app_with_language_capture();
+        let stamp = app.model.document().expect("document").stamp();
+        *snapshot.lock().expect("snapshot") = ready_language_snapshot(stamp);
+        app.editor_cursor_range = Some(collapsed_cursor(0));
+        let ctx = egui::Context::default();
+        app.reconcile_language(&ctx);
+        app.queue_action(AppAction::GoToDefinition);
+
+        app.editor_cursor_range = Some(CCursorRange {
+            primary: CCursor::new(0),
+            secondary: CCursor::new(1),
+            h_pos: None,
+        });
+        app.reconcile_language(&ctx);
+
+        assert!(commands.lock().expect("commands").definitions.is_empty());
+    }
+
+    #[test]
+    fn losing_the_primary_cursor_drops_a_captured_f12() {
+        let (mut app, snapshot, commands) = app_with_language_capture();
+        let stamp = app.model.document().expect("document").stamp();
+        *snapshot.lock().expect("snapshot") = ready_language_snapshot(stamp);
+        app.editor_cursor_range = Some(collapsed_cursor(0));
+        let ctx = egui::Context::default();
+        app.reconcile_language(&ctx);
+        app.queue_action(AppAction::GoToDefinition);
+
+        app.editor_cursor_range = None;
+        app.reconcile_language(&ctx);
+
+        assert!(commands.lock().expect("commands").definitions.is_empty());
+        assert!(matches!(
+            commands.lock().expect("commands").carets.last(),
+            Some(CaretCommand::Current(intent)) if intent.primary_character.is_none()
+        ));
+    }
+
+    #[test]
+    fn definition_result_installs_one_neutral_target_and_is_acknowledged_once() {
+        let (mut app, snapshot, commands) = app_with_language_capture();
+        let stamp = set_source(&mut app, "print 1;");
+        *snapshot.lock().expect("snapshot") = ready_language_snapshot(stamp);
+        app.editor_cursor_range = Some(collapsed_cursor(0));
+        let ctx = egui::Context::default();
+        app.reconcile_language(&ctx);
+        app.queue_action(AppAction::GoToDefinition);
+        app.reconcile_language(&ctx);
+        let navigation = NavigationGeneration::from_raw(1).expect("navigation");
+        *snapshot.lock().expect("snapshot") = language_snapshot(
+            stamp,
+            None,
+            Some(definition_result(
+                stamp,
+                navigation,
+                std::slice::from_ref(&(0..5)),
+            )),
+        );
+
+        app.reconcile_language(&ctx);
+        app.reconcile_language(&ctx);
+
+        let target = app.navigation_target.as_ref().expect("definition target");
+        assert_eq!(target.navigation_generation, navigation);
+        assert_eq!(target.range.byte_range, 0..5);
+        let commands = commands.lock().expect("commands");
+        assert_eq!(commands.acknowledgements.len(), 1);
+        assert_eq!(
+            commands.acknowledgements[0].definition,
+            DefinitionResultId::from_raw(1)
+        );
+    }
+
+    #[test]
+    fn stale_definition_is_acknowledged_but_cannot_replace_a_newer_navigation_intent() {
+        let (mut app, snapshot, commands) = app_with_language_capture();
+        let stamp = set_source(&mut app, "print 1;");
+        *snapshot.lock().expect("snapshot") = ready_language_snapshot(stamp);
+        app.editor_cursor_range = Some(collapsed_cursor(0));
+        let ctx = egui::Context::default();
+        app.reconcile_language(&ctx);
+        app.queue_action(AppAction::GoToDefinition);
+        app.reconcile_language(&ctx);
+        let old = NavigationGeneration::from_raw(1).expect("old navigation");
+        let newer = app
+            .allocate_navigation_generation()
+            .expect("newer navigation");
+        assert!(newer > old);
+        *snapshot.lock().expect("snapshot") = language_snapshot(
+            stamp,
+            None,
+            Some(definition_result(stamp, old, std::slice::from_ref(&(0..5)))),
+        );
+
+        app.reconcile_language(&ctx);
+
+        assert!(app.navigation_target.is_none());
+        assert_eq!(commands.lock().expect("commands").acknowledgements.len(), 1);
+    }
+
+    #[test]
+    fn analysis_reveal_latch_ignores_stale_batches_and_resets_on_matching_empty_publish() {
+        let (mut app, snapshot, _commands) = app_with_language_capture();
+        let stamp = set_source(&mut app, "print 1;");
+        let ctx = egui::Context::default();
+        *snapshot.lock().expect("snapshot") =
+            language_snapshot(stamp, Some(diagnostics(stamp, 1, &[Some(0..5)])), None);
+        app.console_tab = ConsoleTab::Output;
+        app.reconcile_language(&ctx);
+        assert_eq!(app.console_tab, ConsoleTab::Problems);
+
+        app.console_tab = ConsoleTab::Output;
+        app.reconcile_language(&ctx);
+        assert_eq!(app.console_tab, ConsoleTab::Output);
+
+        *snapshot.lock().expect("snapshot") =
+            language_snapshot(stamp, Some(diagnostics(stamp, 2, &[])), None);
+        app.reconcile_language(&ctx);
+        assert_eq!(app.console_tab, ConsoleTab::Output);
+
+        *snapshot.lock().expect("snapshot") =
+            language_snapshot(stamp, Some(diagnostics(stamp, 3, &[Some(0..5)])), None);
+        app.reconcile_language(&ctx);
+        assert_eq!(app.console_tab, ConsoleTab::Problems);
+    }
+
+    #[test]
+    fn diagnostic_click_is_dropped_when_its_batch_is_replaced_before_application() {
+        let (mut app, snapshot, _commands) = app_with_language_capture();
+        let stamp = set_source(&mut app, "print 1;");
+        let current = diagnostics(stamp, 1, &[Some(0..5)]);
+        *snapshot.lock().expect("snapshot") = language_snapshot(stamp, Some(current.clone()), None);
+        let ctx = egui::Context::default();
+        app.reconcile_language(&ctx);
+        let navigation_generation = app.allocate_navigation_generation().expect("navigation");
+        app.pending_analysis_click = Some(PendingAnalysisClick {
+            navigation_generation,
+            process_generation: current.process_generation,
+            stamp,
+            diagnostic_revision: current.revision,
+            item_id: current.items[0].id,
+            range: DocumentRange::new(stamp, 0..5, CharIndex(0)..CharIndex(5)),
+        });
+        *snapshot.lock().expect("snapshot") =
+            language_snapshot(stamp, Some(diagnostics(stamp, 2, &[Some(6..7)])), None);
+
+        app.reconcile_language(&ctx);
+
+        assert!(app.navigation_target.is_none());
+    }
+
+    #[test]
+    fn current_diagnostic_click_installs_its_exact_document_range() {
+        let (mut app, snapshot, _commands) = app_with_language_capture();
+        let stamp = set_source(&mut app, "print 1;");
+        let current = diagnostics(stamp, 1, &[Some(0..5)]);
+        *snapshot.lock().expect("snapshot") = language_snapshot(stamp, Some(current.clone()), None);
+        let ctx = egui::Context::default();
+        app.reconcile_language(&ctx);
+        let navigation_generation = app.allocate_navigation_generation().expect("navigation");
+        app.pending_analysis_click = Some(PendingAnalysisClick {
+            navigation_generation,
+            process_generation: current.process_generation,
+            stamp,
+            diagnostic_revision: current.revision,
+            item_id: current.items[0].id,
+            range: DocumentRange::new(stamp, 0..5, CharIndex(0)..CharIndex(5)),
+        });
+
+        app.reconcile_language(&ctx);
+
+        let target = app.navigation_target.as_ref().expect("analysis target");
+        assert_eq!(target.navigation_generation, navigation_generation);
+        assert_eq!(target.range.byte_range, 0..5);
+    }
+
+    #[test]
+    fn zero_and_multiple_definition_results_are_bounded_and_choose_source_order() {
+        let run_case = |targets: &[std::ops::Range<usize>]| {
+            let (mut app, snapshot, commands) = app_with_language_capture();
+            let stamp = set_source(&mut app, "print 1;");
+            *snapshot.lock().expect("snapshot") = ready_language_snapshot(stamp);
+            app.editor_cursor_range = Some(collapsed_cursor(0));
+            let ctx = egui::Context::default();
+            app.reconcile_language(&ctx);
+            app.queue_action(AppAction::GoToDefinition);
+            app.reconcile_language(&ctx);
+            let navigation = NavigationGeneration::from_raw(1).expect("navigation");
+            *snapshot.lock().expect("snapshot") = language_snapshot(
+                stamp,
+                None,
+                Some(definition_result(stamp, navigation, targets)),
+            );
+            app.reconcile_language(&ctx);
+            (app, commands)
+        };
+
+        let (zero, zero_commands) = run_case(&[]);
+        assert!(zero.navigation_target.is_none());
+        assert_eq!(
+            zero.language_notice.as_deref(),
+            Some("No definition was found.")
+        );
+        assert_eq!(
+            zero_commands
+                .lock()
+                .expect("zero commands")
+                .acknowledgements
+                .len(),
+            1
+        );
+
+        let (multiple, multiple_commands) = run_case(&[0..5, 6..7]);
+        assert_eq!(
+            multiple
+                .navigation_target
+                .as_ref()
+                .expect("first definition")
+                .range
+                .byte_range,
+            0..5
+        );
+        assert_eq!(
+            multiple.language_notice.as_deref(),
+            Some("2 definitions found; showing the first.")
+        );
+        assert_eq!(
+            multiple_commands
+                .lock()
+                .expect("multiple commands")
+                .acknowledgements
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn current_snapshot_maps_all_six_syntax_kinds_into_the_prepared_editor_plan() {
+        let (mut app, snapshot, _commands) = app_with_language_capture();
+        let stamp = set_source(&mut app, "abcdef");
+        let process_generation = ProcessGeneration::from_raw(1).expect("process");
+        let version = LspVersion::from_raw(1).expect("version");
+        let kinds = [
+            SyntaxKind::Keyword,
+            SyntaxKind::Comment,
+            SyntaxKind::String,
+            SyntaxKind::Number,
+            SyntaxKind::Variable,
+            SyntaxKind::Operator,
+        ];
+        let syntax = SyntaxSnapshot {
+            process_generation,
+            uri: Arc::from(synthetic_uri(stamp.document_id)),
+            stamp,
+            lsp_version: version,
+            runs: kinds
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, kind)| SyntaxRun {
+                    range: TextRange {
+                        bytes: index..index + 1,
+                        characters: index..index + 1,
+                    },
+                    kind,
+                })
+                .collect(),
+        };
+        *snapshot.lock().expect("snapshot") =
+            language_snapshot_with_syntax(stamp, None, Some(syntax), None);
+        app.reconcile_language(&egui::Context::default());
+
+        let (plan, _) = app.editor_layout_plan();
+        let actual = plan
+            .expect("layout")
+            .runs()
+            .iter()
+            .filter_map(|run| run.syntax)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual,
+            vec![
+                SyntaxClass::Keyword,
+                SyntaxClass::Comment,
+                SyntaxClass::String,
+                SyntaxClass::Number,
+                SyntaxClass::Variable,
+                SyntaxClass::Operator,
+            ]
+        );
+    }
+
+    #[test]
+    fn fresh_process_can_reuse_a_definition_id_and_is_processed_and_acknowledged() {
+        let (mut app, snapshot, commands) = app_with_language_capture();
+        let stamp = set_source(&mut app, "print 1;");
+        let process_one = ProcessGeneration::from_raw(1).expect("process one");
+        let process_two = ProcessGeneration::from_raw(2).expect("process two");
+        let ctx = egui::Context::default();
+        app.editor_cursor_range = Some(collapsed_cursor(0));
+
+        *snapshot.lock().expect("snapshot") =
+            language_snapshot_for_process(stamp, process_one, None, None, None);
+        app.reconcile_language(&ctx);
+        app.queue_action(AppAction::GoToDefinition);
+        app.reconcile_language(&ctx);
+        let first_navigation = NavigationGeneration::from_raw(1).expect("first navigation");
+        *snapshot.lock().expect("snapshot") = language_snapshot_for_process(
+            stamp,
+            process_one,
+            None,
+            None,
+            Some(definition_result_for_process(
+                stamp,
+                process_one,
+                first_navigation,
+                std::slice::from_ref(&(0..5)),
+            )),
+        );
+        app.reconcile_language(&ctx);
+        assert_eq!(commands.lock().expect("commands").acknowledgements.len(), 1);
+
+        *snapshot.lock().expect("snapshot") =
+            language_snapshot_for_process(stamp, process_two, None, None, None);
+        app.reconcile_language(&ctx);
+        assert!(app.navigation_target.is_none());
+        assert!(app.language_notice.is_none());
+        app.queue_action(AppAction::GoToDefinition);
+        app.reconcile_language(&ctx);
+        let second_navigation = NavigationGeneration::from_raw(2).expect("second navigation");
+        *snapshot.lock().expect("snapshot") = language_snapshot_for_process(
+            stamp,
+            process_two,
+            None,
+            None,
+            Some(definition_result_for_process(
+                stamp,
+                process_two,
+                second_navigation,
+                std::slice::from_ref(&(6..7)),
+            )),
+        );
+
+        app.reconcile_language(&ctx);
+
+        assert_eq!(commands.lock().expect("commands").acknowledgements.len(), 2);
+        let target = app.navigation_target.as_ref().expect("process two target");
+        assert_eq!(target.navigation_generation, second_navigation);
+        assert_eq!(target.range.byte_range, 6..7);
+    }
+
+    #[test]
+    fn fresh_process_can_reuse_a_notice_id_without_suppressing_the_new_message() {
+        let (mut app, snapshot, commands) = app_with_language_capture();
+        let stamp = app.model.document().expect("document").stamp();
+        let process_one = ProcessGeneration::from_raw(1).expect("process one");
+        let process_two = ProcessGeneration::from_raw(2).expect("process two");
+        let notice_id = NoticeId::from_raw(1).expect("notice id");
+        let make_notice = |message: &'static str| LanguageNotice {
+            id: notice_id,
+            kind: NoticeKind::Information,
+            message: Arc::from(message),
+        };
+        let ctx = egui::Context::default();
+
+        *snapshot.lock().expect("snapshot") = language_snapshot_for_process_with_notices(
+            stamp,
+            process_one,
+            None,
+            None,
+            None,
+            vec![make_notice("first process")],
+        );
+        app.reconcile_language(&ctx);
+        assert_eq!(app.language_notice.as_deref(), Some("first process"));
+        assert_eq!(commands.lock().expect("commands").acknowledgements.len(), 1);
+
+        *snapshot.lock().expect("snapshot") = language_snapshot_for_process_with_notices(
+            stamp,
+            process_two,
+            None,
+            None,
+            None,
+            vec![make_notice("second process")],
+        );
+        app.reconcile_language(&ctx);
+
+        assert_eq!(app.language_notice.as_deref(), Some("second process"));
+        assert_eq!(commands.lock().expect("commands").acknowledgements.len(), 2);
+    }
+
+    #[test]
+    fn one_reconciliation_pass_cannot_mix_reused_items_from_two_process_snapshots() {
+        let model = AppModel::new();
+        let stamp = model.document().expect("document").stamp();
+        let process_one = ProcessGeneration::from_raw(1).expect("process one");
+        let process_two = ProcessGeneration::from_raw(2).expect("process two");
+        let definition_id = DefinitionResultId::from_raw(1).expect("definition id");
+        let notice_id = NoticeId::from_raw(1).expect("notice id");
+        let navigation = NavigationGeneration::from_raw(1).expect("navigation");
+        let snapshot = |process_generation, message: &'static str| {
+            let mut definition =
+                definition_result_for_process(stamp, process_generation, navigation, &[]);
+            definition.id = definition_id;
+            language_snapshot_for_process_with_notices(
+                stamp,
+                process_generation,
+                None,
+                None,
+                Some(definition),
+                vec![LanguageNotice {
+                    id: notice_id,
+                    kind: NoticeKind::Information,
+                    message: Arc::from(message),
+                }],
+            )
+        };
+        let (mut app, commands) = app_with_language_sequence([
+            unavailable_snapshot(),
+            snapshot(process_one, "process one"),
+            snapshot(process_two, "process two"),
+        ]);
+        let ctx = egui::Context::default();
+
+        app.reconcile_language(&ctx);
+        assert_eq!(app.language_process, Some(process_one));
+        assert_eq!(app.language_notice.as_deref(), Some("process one"));
+
+        app.reconcile_language(&ctx);
+        assert_eq!(app.language_process, Some(process_two));
+        assert_eq!(app.language_notice.as_deref(), Some("process two"));
+
+        let commands = commands.lock().expect("commands");
+        assert_eq!(commands.acknowledgements.len(), 2);
+        for (acknowledgement, process_generation) in commands
+            .acknowledgements
+            .iter()
+            .zip([process_one, process_two])
+        {
+            assert_eq!(acknowledgement.process_generation, process_generation);
+            assert_eq!(acknowledgement.definition, Some(definition_id));
+            assert_eq!(acknowledgement.notices.as_ref(), [notice_id]);
+        }
+    }
+
+    #[test]
+    fn same_length_edit_invalidates_the_shared_prepared_layout_and_navigation_source() {
+        let planned: Arc<str> = Arc::from("print 1;");
+
+        assert!(prepared_editor_source_is_current(
+            Some(&planned),
+            "print 1;"
+        ));
+        assert!(!prepared_editor_source_is_current(
+            Some(&planned),
+            "print 2;"
+        ));
+        assert!(!prepared_editor_source_is_current(None, "print 1;"));
+    }
+
+    #[test]
+    fn same_length_replacement_skips_prepared_syntax_and_marker_formatting() {
+        let stamp = AppModel::new().document().expect("document").stamp();
+        let planned_source: Arc<str> = Arc::from("print 1;");
+        let mapper = SourceMapper::for_document(stamp, planned_source.as_ref());
+        let range = DocumentRange::new(stamp, 0..5, CharIndex(0)..CharIndex(5));
+        let markers = mapper.resolve_document_markers(DocumentMarkerInputs {
+            navigation: Some(range.clone()),
+            ..DocumentMarkerInputs::default()
+        });
+        let plan = PreparedLayoutPlan::compose(
+            &mapper,
+            &markers,
+            &[PreparedSyntaxRun::new(range, SyntaxClass::Keyword)],
+        );
+        assert!(plan.runs().iter().any(|run| {
+            run.syntax == Some(SyntaxClass::Keyword) && run.markers.contains(MarkerKind::Navigation)
+        }));
+        let mut formatting_calls = 0;
+
+        let job = current_prepared_layout_job(
+            Some(stamp),
+            Some(&planned_source),
+            "print 2;",
+            Some(&plan),
+            |_, _| {
+                formatting_calls += 1;
+                egui::TextFormat::default()
+            },
+        );
+
+        assert!(job.is_none());
+        assert_eq!(formatting_calls, 0);
+    }
+
+    #[test]
+    fn same_length_ui_edit_does_not_apply_a_pre_edit_navigation_selection() {
+        let app = language_ready_app("print 1;");
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1_100.0, 700.0))
+            .build_eframe(move |_| app);
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .focus();
+        harness.run();
+
+        {
+            let app = harness.state_mut();
+            let stamp = app.model.document().expect("document").stamp();
+            let navigation = app
+                .allocate_navigation_generation()
+                .expect("navigation generation");
+            assert!(app.install_navigation_target(
+                navigation,
+                NavigationOrigin::Language {
+                    process_generation: ProcessGeneration::from_raw(1).expect("process"),
+                },
+                DocumentRange::new(stamp, 0..5, CharIndex(0)..CharIndex(5)),
+            ));
+        }
+
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .type_text("print 2;");
+        harness.run();
+        harness.run();
+
+        let app = harness.state();
+        assert_eq!(app.model.document().expect("document").text(), "print 2;");
+        assert!(app.navigation_target.is_none());
+        let cursor = app.editor_cursor_range.expect("editor cursor");
+        assert_eq!(cursor.primary.index.0, "print 2;".chars().count());
+        assert_eq!(cursor.secondary.index.0, cursor.primary.index.0);
+    }
+
+    #[test]
+    fn same_frame_caret_change_cancels_a_pending_navigation_selection() {
+        let app = language_ready_app("print 1;");
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1_100.0, 700.0))
+            .build_eframe(move |_| app);
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .focus();
+        harness.run();
+        let initial_cursor = harness
+            .state()
+            .editor_cursor_range
+            .expect("initial editor cursor");
+        assert_eq!(
+            initial_cursor.primary.index.0,
+            initial_cursor.secondary.index.0
+        );
+        let (movement, expected_character) = if initial_cursor.primary.index.0 == 0 {
+            (egui::Key::ArrowRight, 1)
+        } else {
+            (egui::Key::ArrowLeft, initial_cursor.primary.index.0 - 1)
+        };
+
+        {
+            let app = harness.state_mut();
+            let stamp = app.model.document().expect("document").stamp();
+            let navigation = app
+                .allocate_navigation_generation()
+                .expect("navigation generation");
+            assert!(app.install_navigation_target(
+                navigation,
+                NavigationOrigin::Language {
+                    process_generation: ProcessGeneration::from_raw(1).expect("process"),
+                },
+                DocumentRange::new(stamp, 0..5, CharIndex(0)..CharIndex(5)),
+            ));
+        }
+
+        harness.key_press(movement);
+        harness.run();
+        harness.run();
+
+        let app = harness.state();
+        assert!(app.navigation_target.is_none());
+        let cursor = app.editor_cursor_range.expect("moved editor cursor");
+        assert_eq!(cursor.primary.index.0, expected_character);
+        assert_eq!(cursor.secondary.index.0, expected_character);
     }
 
     #[test]

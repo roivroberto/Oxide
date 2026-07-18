@@ -1,6 +1,12 @@
 mod app;
+mod contained_child;
 mod editor;
 pub mod file_dialog;
+#[allow(dead_code)]
+mod language;
+mod language_ui;
+#[cfg(test)]
+mod language_ui_tests;
 mod model;
 mod process;
 mod runtime;

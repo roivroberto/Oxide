@@ -8,7 +8,9 @@ publish = false
 embed-resource = "=3.0.11"
 
 [dependencies]
+arc-swap.workspace = true
 eframe = { version = "=0.35.0", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+lsp-types.workspace = true
 rlox-protocol = { path = "../rlox-protocol" }
 rfd = { version = "=0.17.2", features = ["common-controls-v6"] }
 serde.workspace = true

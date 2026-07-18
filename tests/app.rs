@@ -1,3 +1,4 @@
+use eframe::egui::{Key, KeyboardShortcut, Modifiers};
 use egui_kittest::{
     Harness,
     kittest::{NodeT, Queryable},
@@ -288,8 +289,51 @@ fn idle_app_exposes_one_complete_action_catalog() {
             (AppAction::StepOver, false),
             (AppAction::StepOut, false),
             (AppAction::Stop, false),
+            (AppAction::GoToDefinition, false),
         ]
     );
+}
+
+#[test]
+fn go_to_definition_is_a_plain_f12_navigation_action_without_a_toolbar_button() {
+    let app = OxideApp::headless(AppModel::new());
+    let catalog = app.action_catalog();
+    let definition = catalog
+        .iter()
+        .find(|spec| spec.action == AppAction::GoToDefinition)
+        .expect("go to definition action");
+
+    assert_eq!(definition.section, oxide_ide::ActionSection::Navigate);
+    assert_eq!(definition.label, "Go to Definition");
+    assert_eq!(
+        definition.shortcut,
+        Some(KeyboardShortcut::new(Modifiers::NONE, Key::F12))
+    );
+    assert!(!definition.show_in_toolbar);
+
+    for (action, shortcut) in [
+        (
+            AppAction::Debug,
+            KeyboardShortcut::new(Modifiers::NONE, Key::F5),
+        ),
+        (
+            AppAction::StepOver,
+            KeyboardShortcut::new(Modifiers::NONE, Key::F10),
+        ),
+        (
+            AppAction::StepInto,
+            KeyboardShortcut::new(Modifiers::NONE, Key::F11),
+        ),
+    ] {
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|spec| spec.action == action)
+                .and_then(|spec| spec.shortcut),
+            Some(shortcut),
+            "{action:?} shortcut changed"
+        );
+    }
 }
 
 #[test]
@@ -330,6 +374,15 @@ fn headless_app_renders_the_required_accessible_shell() {
     harness.get_by_label("Symbols");
     harness.get_by_label("Call Stack");
     harness.get_by_label("Ready");
+    harness.get_by_label("Language: unavailable");
+    harness.get_by_label("Navigate").click();
+    harness.run();
+    assert!(
+        harness
+            .get_by_label("Go to Definition F12")
+            .accesskit_node()
+            .is_disabled()
+    );
 
     let run = harness.get_by_label("Run all");
     assert!(!run.accesskit_node().is_disabled());
@@ -619,15 +672,20 @@ fn problem_and_frame_buttons_emit_exact_provenance_and_symbols_are_visible() {
     harness.run();
     harness.run();
     let effects = harness.state_mut().take_pending_effects();
-    assert!(matches!(
-        effects.as_slice(),
-        [ModelEffect::Navigate {
-            navigation_generation,
-            document: _,
-            run: actual,
-            span: _
-        }] if navigation_generation.get() == 1 && *actual == run
-    ));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [ModelEffect::Navigate {
+                navigation_generation,
+                document: _,
+                run: actual,
+                span: _
+            }] if navigation_generation.get() == 1 && *actual == run
+        ),
+        "unexpected effects: {effects:#?}; selected={:?}; queued={}",
+        harness.state().model().selected_problem(),
+        harness.state().pending_event_count()
+    );
 
     harness.get_by_label("Call Stack").click();
     harness.run();

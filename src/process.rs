@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
+use std::process::{ChildStderr, ChildStdin, ChildStdout, Command as ProcessCommand};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -34,515 +34,7 @@ const STATE_CLOSED: u8 = 6;
 
 static NEXT_WORKER_SESSION: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(not(windows))]
-mod worker_containment {
-    use std::io;
-    use std::process::{Child, Command, ExitStatus};
-
-    pub(super) struct WorkerJob;
-
-    impl WorkerJob {
-        pub(super) fn create() -> io::Result<Self> {
-            Ok(Self)
-        }
-
-        pub(super) fn assign(&self, _child: &Child) -> io::Result<()> {
-            Ok(())
-        }
-
-        pub(super) fn prepare_command(_command: &mut Command) {}
-
-        pub(super) fn resume(&self, _child: &Child) -> io::Result<()> {
-            Ok(())
-        }
-
-        pub(super) fn terminate(&mut self, child: &mut Child) -> io::Result<()> {
-            child.kill()
-        }
-    }
-
-    pub(super) fn wait_for_termination(child: &mut Child) -> io::Result<ExitStatus> {
-        child.wait()
-    }
-}
-
-#[cfg(windows)]
-mod worker_containment {
-    use std::ffi::c_void;
-    use std::io;
-    use std::mem::size_of;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use std::os::windows::process::CommandExt;
-    use std::process::{Child, Command, ExitStatus};
-    use std::ptr;
-
-    use windows_sys::Win32::Foundation::{
-        ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
-    };
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-    };
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject,
-    };
-    use windows_sys::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CREATE_SUSPENDED, GetProcessIdOfThread, OpenThread, ResumeThread,
-        THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME, WaitForSingleObject,
-    };
-
-    const TERMINATION_WAIT_MILLIS: u32 = 5_000;
-
-    pub(super) struct WorkerJob {
-        handle: Option<OwnedHandle>,
-    }
-
-    impl WorkerJob {
-        pub(super) fn create() -> io::Result<Self> {
-            // SAFETY: Null security attributes and name request a new anonymous job object.
-            let raw_handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-            if raw_handle.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-
-            // SAFETY: CreateJobObjectW returned a new owned handle, checked non-null above.
-            let job = Self {
-                handle: Some(unsafe { OwnedHandle::from_raw_handle(raw_handle) }),
-            };
-            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            // SAFETY: The handle is a live job handle and the pointer/size describe a fully
-            // initialized JOBOBJECT_EXTENDED_LIMIT_INFORMATION for the requested class.
-            let configured = unsafe {
-                SetInformationJobObject(
-                    job.raw_handle(),
-                    JobObjectExtendedLimitInformation,
-                    ptr::from_ref(&limits).cast::<c_void>(),
-                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
-            };
-            if configured == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(job)
-        }
-
-        pub(super) fn assign(&self, child: &Child) -> io::Result<()> {
-            // SAFETY: Both handles are live for the duration of this call. No breakaway flags
-            // are requested, so descendants remain governed by the job's default inheritance.
-            let assigned = unsafe {
-                AssignProcessToJobObject(self.raw_handle(), child.as_raw_handle().cast())
-            };
-            if assigned == 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        }
-
-        pub(super) fn prepare_command(command: &mut Command) {
-            command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
-        }
-
-        pub(super) fn resume(&self, child: &Child) -> io::Result<()> {
-            // SAFETY: The snapshot handle is checked before ownership is assumed.
-            let snapshot_raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-            if snapshot_raw == INVALID_HANDLE_VALUE || snapshot_raw.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: CreateToolhelp32Snapshot returned a new owned handle.
-            let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot_raw) };
-            let mut entry = THREADENTRY32 {
-                dwSize: size_of::<THREADENTRY32>() as u32,
-                ..THREADENTRY32::default()
-            };
-            // SAFETY: entry points to initialized writable storage with the required size field.
-            if unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            let mut thread_handles = Vec::new();
-            loop {
-                if entry.th32OwnerProcessID == child.id() {
-                    // SAFETY: The thread ID comes from the live system snapshot. The returned
-                    // handle is checked before ownership is assumed and is non-inheritable.
-                    let thread_raw = unsafe {
-                        OpenThread(
-                            THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
-                            0,
-                            entry.th32ThreadID,
-                        )
-                    };
-                    if thread_raw.is_null() {
-                        return Err(io::Error::last_os_error());
-                    }
-                    // SAFETY: OpenThread returned a new owned handle, checked non-null above.
-                    let thread = unsafe { OwnedHandle::from_raw_handle(thread_raw) };
-                    // SAFETY: The opened handle has query rights and remains live for this call.
-                    let owner = unsafe { GetProcessIdOfThread(thread.as_raw_handle()) };
-                    if owner == 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if owner != child.id() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "worker thread ownership changed during suspended launch",
-                        ));
-                    }
-                    thread_handles.push(thread);
-                }
-
-                // SAFETY: entry remains valid writable storage for the next snapshot record.
-                if unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } == 0 {
-                    let error = io::Error::last_os_error();
-                    if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
-                        break;
-                    }
-                    return Err(error);
-                }
-            }
-
-            if thread_handles.len() != 1 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "suspended worker must have exactly one primary thread",
-                ));
-            }
-            // SAFETY: Child owns a live process handle. A zero-timeout wait probes whether the
-            // exact process object is still alive before its thread is resumed.
-            let process_wait = unsafe { WaitForSingleObject(child.as_raw_handle().cast(), 0) };
-            if process_wait == WAIT_FAILED {
-                return Err(io::Error::last_os_error());
-            }
-            if process_wait != WAIT_TIMEOUT {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "suspended worker exited before primary-thread resume",
-                ));
-            }
-            // SAFETY: The sole thread belongs to the still-suspended child. A previous suspend
-            // count of exactly one proves this call releases the CREATE_SUSPENDED hold.
-            let previous = unsafe { ResumeThread(thread_handles[0].as_raw_handle()) };
-            if previous == u32::MAX {
-                return Err(io::Error::last_os_error());
-            }
-            if previous != 1 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "worker primary thread had an unexpected suspend count",
-                ));
-            }
-            Ok(())
-        }
-
-        pub(super) fn terminate(&mut self, child: &mut Child) -> io::Result<()> {
-            // SAFETY: The handle is a live job handle. Terminating the job prevents a
-            // descendant holding an inherited worker pipe from blocking reader shutdown.
-            let terminated = unsafe { TerminateJobObject(self.raw_handle(), 1) };
-            if terminated == 0 {
-                let error = io::Error::last_os_error();
-                drop(self.handle.take());
-                let _ = child.kill();
-                Err(error)
-            } else {
-                Ok(())
-            }
-        }
-
-        fn raw_handle(&self) -> *mut c_void {
-            self.handle
-                .as_ref()
-                .expect("worker Job Object handle remains live")
-                .as_raw_handle()
-        }
-    }
-
-    pub(super) fn wait_for_termination(child: &mut Child) -> io::Result<ExitStatus> {
-        // SAFETY: Child owns the exact process handle for the spawned worker. The bounded wait
-        // prevents a failed termination attempt from hanging IDE startup indefinitely.
-        match unsafe { WaitForSingleObject(child.as_raw_handle().cast(), TERMINATION_WAIT_MILLIS) }
-        {
-            WAIT_OBJECT_0 => child.wait(),
-            WAIT_TIMEOUT => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "worker did not exit after termination",
-            )),
-            WAIT_FAILED => Err(io::Error::last_os_error()),
-            result => Err(io::Error::other(format!(
-                "unexpected worker termination wait result: {result}"
-            ))),
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use std::io::{BufRead, BufReader, Read, Write};
-        use std::process::{Command, Stdio};
-        use std::thread;
-        use std::time::{Duration, Instant};
-        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
-        use windows_sys::Win32::System::JobObjects::{IsProcessInJob, QueryInformationJobObject};
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
-        };
-
-        #[test]
-        fn job_is_configured_to_kill_all_members_when_its_handle_closes() {
-            let job = WorkerJob::create().expect("create worker job");
-            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            let mut returned = 0;
-            // SAFETY: The output pointer and size describe writable storage of the class queried.
-            let queried = unsafe {
-                QueryInformationJobObject(
-                    job.raw_handle(),
-                    JobObjectExtendedLimitInformation,
-                    ptr::from_mut(&mut limits).cast::<c_void>(),
-                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                    &mut returned,
-                )
-            };
-
-            assert_ne!(queried, 0, "{}", io::Error::last_os_error());
-            assert_eq!(
-                limits.BasicLimitInformation.LimitFlags,
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            );
-        }
-
-        #[test]
-        fn closing_the_job_terminates_an_assigned_root_process() {
-            let job = WorkerJob::create().expect("create worker job");
-            let mut child = Command::new("cmd.exe")
-                .args(["/D", "/C", "ping.exe -n 30 127.0.0.1"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn contained process");
-            if let Err(error) = job.assign(&child) {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("assign contained process: {error}");
-            }
-            thread::sleep(Duration::from_millis(100));
-            assert!(
-                child.try_wait().expect("probe contained process").is_none(),
-                "contained process fixture exited before the job handle closed"
-            );
-
-            drop(job);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Ok(None) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        panic!("contained process survived the closed job handle");
-                    }
-                    Err(error) => panic!("wait for contained process: {error}"),
-                }
-            }
-        }
-
-        #[test]
-        fn forced_termination_reaps_a_descendant_that_inherits_the_workers_pipes() {
-            let mut job = WorkerJob::create().expect("create worker job");
-            let fixture = r#"$null = [Console]::In.ReadLine(); $p = Start-Process -FilePath "$env:SystemRoot\System32\ping.exe" -ArgumentList "-n","30","127.0.0.1" -NoNewWindow -PassThru; [Console]::Out.WriteLine($p.Id); [Console]::Out.Flush(); $p.WaitForExit()"#;
-            let mut child = Command::new("powershell.exe")
-                .args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    fixture,
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn synchronized process-tree fixture");
-            if let Err(error) = job.assign(&child) {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("assign process-tree fixture: {error}");
-            }
-
-            let mut stdin = child.stdin.take().expect("fixture stdin");
-            let mut stdout = BufReader::new(child.stdout.take().expect("fixture stdout"));
-            writeln!(stdin).expect("release process-tree fixture");
-            drop(stdin);
-            let descendant_pid = loop {
-                let mut line = String::new();
-                let bytes = stdout.read_line(&mut line).expect("read fixture output");
-                assert_ne!(
-                    bytes, 0,
-                    "fixture exited before reporting its descendant PID"
-                );
-                if let Ok(pid) = line.trim().parse::<u32>() {
-                    break pid;
-                }
-            };
-            // SAFETY: The PID was reported by the live fixture. The returned handle is checked
-            // before converting it to an owned handle.
-            let descendant_raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, descendant_pid) };
-            if descendant_raw.is_null() {
-                let _ = job.terminate(&mut child);
-                let _ = child.wait();
-                panic!("open descendant process: {}", io::Error::last_os_error());
-            }
-            // SAFETY: OpenProcess returned a new owned handle, checked non-null above.
-            let descendant = unsafe { OwnedHandle::from_raw_handle(descendant_raw) };
-            // SAFETY: The descendant process handle is live and the zero timeout only probes it.
-            assert_eq!(
-                unsafe { WaitForSingleObject(descendant.as_raw_handle(), 0) },
-                WAIT_TIMEOUT,
-                "descendant exited before forced termination"
-            );
-
-            job.terminate(&mut child).expect("terminate worker job");
-            child.wait().expect("reap process-tree fixture");
-            // SAFETY: The descendant process handle remains live until this wait completes.
-            let descendant_wait = unsafe { WaitForSingleObject(descendant.as_raw_handle(), 5_000) };
-            assert_eq!(
-                descendant_wait, WAIT_OBJECT_0,
-                "descendant survived forced Job Object termination"
-            );
-            drop(stdout);
-        }
-
-        #[test]
-        fn spawned_process_remains_suspended_until_job_assignment_completes() {
-            let job = WorkerJob::create().expect("create worker job");
-            let mut command = Command::new("cmd.exe");
-            command
-                .args(["/D", "/C", "echo suspended-worker-ready"])
-                .stdout(Stdio::piped());
-            WorkerJob::prepare_command(&mut command);
-            let mut child = command.spawn().expect("spawn suspended fixture");
-            let mut stdout = child.stdout.take().expect("suspended fixture stdout");
-            let (output_tx, output_rx) = std::sync::mpsc::sync_channel(1);
-            let reader = thread::spawn(move || {
-                let mut output = String::new();
-                let result = stdout.read_to_string(&mut output).map(|_| output);
-                let _ = output_tx.send(result);
-            });
-
-            assert!(matches!(
-                output_rx.recv_timeout(Duration::from_millis(100)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ));
-            if let Err(error) = job.assign(&child) {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("assign suspended fixture: {error}");
-            }
-            let mut assigned = 0;
-            // SAFETY: Both handles remain live, and assigned points to writable BOOL storage.
-            let queried = unsafe {
-                IsProcessInJob(
-                    child.as_raw_handle().cast(),
-                    job.raw_handle(),
-                    &mut assigned,
-                )
-            };
-            assert_ne!(queried, 0, "{}", io::Error::last_os_error());
-            assert_ne!(assigned, 0, "fixture was resumed outside the worker job");
-            assert!(matches!(
-                output_rx.recv_timeout(Duration::from_millis(100)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ));
-            job.resume(&child).expect("resume assigned fixture");
-            let output = output_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("fixture produced output after resume")
-                .expect("read resumed fixture output");
-            assert!(output.contains("suspended-worker-ready"));
-            reader.join().expect("join suspended fixture reader");
-            assert!(child.wait().expect("reap resumed fixture").success());
-        }
-
-        #[test]
-        fn descendant_holding_stdout_is_terminated_after_the_root_is_reaped() {
-            let mut job = WorkerJob::create().expect("create worker job");
-            let fixture = r#"$p = Start-Process -FilePath "$env:SystemRoot\System32\ping.exe" -ArgumentList "-n","30","127.0.0.1" -NoNewWindow -PassThru; [Console]::Out.WriteLine($p.Id); [Console]::Out.Flush()"#;
-            let mut command = Command::new("powershell.exe");
-            command
-                .args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    fixture,
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null());
-            WorkerJob::prepare_command(&mut command);
-            let mut child = command.spawn().expect("spawn root-exit fixture");
-            if let Err(error) = job.assign(&child) {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("assign root-exit fixture: {error}");
-            }
-            job.resume(&child).expect("resume root-exit fixture");
-
-            let mut stdout = BufReader::new(child.stdout.take().expect("fixture stdout"));
-            let descendant_pid = loop {
-                let mut line = String::new();
-                let bytes = stdout.read_line(&mut line).expect("read fixture output");
-                assert_ne!(bytes, 0, "fixture exited before reporting descendant PID");
-                if let Ok(pid) = line.trim().parse::<u32>() {
-                    break pid;
-                }
-            };
-            // SAFETY: The PID was reported by the live fixture. The returned handle is checked
-            // before converting it to an owned handle.
-            let descendant_raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, descendant_pid) };
-            if descendant_raw.is_null() {
-                let error = io::Error::last_os_error();
-                let _ = job.terminate(&mut child);
-                let _ = child.wait();
-                panic!("open descendant process: {error}");
-            }
-            // SAFETY: OpenProcess returned a new owned handle, checked non-null above.
-            let descendant = unsafe { OwnedHandle::from_raw_handle(descendant_raw) };
-            child.wait().expect("reap root process");
-
-            let (eof_tx, eof_rx) = std::sync::mpsc::sync_channel(1);
-            let reader = thread::spawn(move || {
-                let mut retained = Vec::new();
-                let result = stdout.read_to_end(&mut retained);
-                let _ = eof_tx.send(result);
-            });
-            assert!(matches!(
-                eof_rx.recv_timeout(Duration::from_millis(150)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ));
-
-            job.terminate(&mut child)
-                .expect("terminate descendants after root reap");
-            eof_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("stdout reader reached EOF")
-                .expect("read descendant output");
-            reader.join().expect("join stdout reader");
-            // SAFETY: The descendant process handle remains live until this wait completes.
-            assert_eq!(
-                unsafe { WaitForSingleObject(descendant.as_raw_handle(), 5_000) },
-                WAIT_OBJECT_0,
-                "descendant survived termination after root reap"
-            );
-        }
-    }
-}
-
-use worker_containment::WorkerJob;
+use crate::contained_child::{ContainedChild, ContainedPipedChild};
 
 #[derive(Clone, Debug)]
 pub struct SupervisorConfig {
@@ -1003,50 +495,11 @@ impl WorkerSupervisor {
             });
         }
         let session = allocate_worker_session()?;
-        let mut containment =
-            WorkerJob::create().map_err(|error| SupervisorStartError { kind: error.kind() })?;
         let mut command = ProcessCommand::new(&config.executable);
-        command
-            .args(["--debug-worker", "--worker-session", &session.0.to_string()])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        WorkerJob::prepare_command(&mut command);
-        let mut child = command
-            .spawn()
+        command.args(["--debug-worker", "--worker-session", &session.0.to_string()]);
+        let child = ContainedPipedChild::spawn_for_debugger(command)
             .map_err(|error| SupervisorStartError { kind: error.kind() })?;
-        if let Err(error) = containment.assign(&child) {
-            return Err(fail_closed_containment(&mut child, error));
-        }
-        let resume = containment.resume(&child);
-        finish_worker_resume(&mut child, resume, |child| {
-            cleanup_contained_launch(child, &mut containment)
-        })?;
-
-        let Some(stdin) = child.stdin.take() else {
-            let cleanup = cleanup_contained_launch(&mut child, &mut containment);
-            return Err(SupervisorStartError {
-                kind: cleanup
-                    .err()
-                    .map_or(std::io::ErrorKind::BrokenPipe, |error| error.kind()),
-            });
-        };
-        let Some(stdout) = child.stdout.take() else {
-            let cleanup = cleanup_contained_launch(&mut child, &mut containment);
-            return Err(SupervisorStartError {
-                kind: cleanup
-                    .err()
-                    .map_or(std::io::ErrorKind::BrokenPipe, |error| error.kind()),
-            });
-        };
-        let Some(stderr) = child.stderr.take() else {
-            let cleanup = cleanup_contained_launch(&mut child, &mut containment);
-            return Err(SupervisorStartError {
-                kind: cleanup
-                    .err()
-                    .map_or(std::io::ErrorKind::BrokenPipe, |error| error.kind()),
-            });
-        };
+        let (child, stdin, stdout, stderr) = child.into_parts();
 
         let (actor_tx, actor_rx) = mpsc::sync_channel(ACTOR_QUEUE_ITEMS);
         let (writer_tx, writer_rx) = mpsc::sync_channel(WRITER_QUEUE_ITEMS);
@@ -1079,7 +532,6 @@ impl WorkerSupervisor {
                 writer,
                 stdout_reader,
                 stderr_reader,
-                containment,
             );
         });
 
@@ -1139,66 +591,6 @@ fn allocate_worker_session() -> Result<WorkerSessionId, SupervisorStartError> {
         });
     }
     Ok(WorkerSessionId(value))
-}
-
-trait FailedLaunchChild {
-    fn kill_for_failed_launch(&mut self) -> std::io::Result<()>;
-    fn wait_for_failed_launch(&mut self) -> std::io::Result<()>;
-}
-
-impl FailedLaunchChild for Child {
-    fn kill_for_failed_launch(&mut self) -> std::io::Result<()> {
-        self.kill()
-    }
-
-    fn wait_for_failed_launch(&mut self) -> std::io::Result<()> {
-        worker_containment::wait_for_termination(self).map(|_| ())
-    }
-}
-
-fn cleanup_failed_launch<C: FailedLaunchChild>(child: &mut C) -> std::io::Result<()> {
-    let termination = child.kill_for_failed_launch();
-    let reap = child.wait_for_failed_launch();
-    termination.and(reap)
-}
-
-fn cleanup_contained_launch(child: &mut Child, containment: &mut WorkerJob) -> std::io::Result<()> {
-    let termination = containment.terminate(child);
-    let reap = worker_containment::wait_for_termination(child).map(|_| ());
-    termination.and(reap)
-}
-
-fn fail_closed_containment<C: FailedLaunchChild>(
-    child: &mut C,
-    error: std::io::Error,
-) -> SupervisorStartError {
-    let cleanup = cleanup_failed_launch(child);
-    SupervisorStartError {
-        kind: cleanup
-            .err()
-            .map_or_else(|| error.kind(), |error| error.kind()),
-    }
-}
-
-fn finish_worker_resume<C, F>(
-    child: &mut C,
-    resume: std::io::Result<()>,
-    fail_closed: F,
-) -> Result<(), SupervisorStartError>
-where
-    F: FnOnce(&mut C) -> std::io::Result<()>,
-{
-    match resume {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let cleanup = fail_closed(child);
-            Err(SupervisorStartError {
-                kind: cleanup
-                    .err()
-                    .map_or_else(|| error.kind(), |error| error.kind()),
-            })
-        }
-    }
 }
 
 enum ActorMessage {
@@ -1442,7 +834,7 @@ impl ActorState {
 
 #[allow(clippy::too_many_arguments)]
 fn supervisor_actor(
-    mut child: Child,
+    mut child: ContainedChild,
     session: WorkerSessionId,
     config: SupervisorConfig,
     messages: mpsc::Receiver<ActorMessage>,
@@ -1453,10 +845,9 @@ fn supervisor_actor(
     writer: thread::JoinHandle<()>,
     stdout_reader: thread::JoinHandle<()>,
     stderr_reader: thread::JoinHandle<()>,
-    mut containment: WorkerJob,
 ) {
     let Ok(mut state) = ActorState::new(session, &config) else {
-        let _ = cleanup_contained_launch(&mut child, &mut containment);
+        let _ = child.cleanup_for_debugger();
         join_actor_producers(messages, writer_tx, writer, stdout_reader, stderr_reader);
         public_state.store(STATE_CLOSED, Ordering::Release);
         return;
@@ -1497,9 +888,9 @@ fn supervisor_actor(
 
         check_deadlines(&config, &mut state);
         if should_terminate_containment(&state) {
-            ensure_killed_and_reaped(&mut child, &mut containment, &mut state);
+            ensure_killed_and_reaped(&mut child, &mut state);
         } else if state.child_status.is_none() {
-            match child.try_wait() {
+            match child.try_wait_root() {
                 Ok(Some(status)) => {
                     state.child_status = Some(status.code());
                     if !state.terminal_seen && !state.close_requested {
@@ -2261,15 +1652,15 @@ fn should_terminate_containment(state: &ActorState) -> bool {
         || state.child_status.is_some() && (!state.stdout_done || state.stderr.is_none())
 }
 
-fn ensure_killed_and_reaped(
-    child: &mut Child,
-    containment: &mut WorkerJob,
-    state: &mut ActorState,
-) {
+fn should_report_containment_termination_error(kind: std::io::ErrorKind) -> bool {
+    kind != std::io::ErrorKind::InvalidInput
+}
+
+fn ensure_killed_and_reaped(child: &mut ContainedChild, state: &mut ActorState) {
     if !state.containment_terminated {
         state.containment_terminated = true;
-        if let Err(error) = containment.terminate(child)
-            && error.kind() != std::io::ErrorKind::InvalidInput
+        if let Err(error) = child.terminate_tree_once()
+            && should_report_containment_termination_error(error.kind())
         {
             if state.terminal_seen {
                 state.closure_health = ClosureHealth::IoFailure;
@@ -2281,7 +1672,7 @@ fn ensure_killed_and_reaped(
     if state.child_status.is_some() {
         return;
     }
-    match worker_containment::wait_for_termination(child) {
+    match child.wait_root_for_debugger() {
         Ok(status) => state.child_status = Some(status.code()),
         Err(error) => {
             state.child_status = Some(None);
@@ -2330,28 +1721,6 @@ fn finalize_supervisor(session: WorkerSessionId, state: &ActorState, inbox: &Sup
 mod tests {
     use super::*;
 
-    #[derive(Default)]
-    struct FakeFailedLaunchChild {
-        killed: bool,
-        waited: bool,
-        kill_error: Option<std::io::ErrorKind>,
-        wait_error: Option<std::io::ErrorKind>,
-    }
-
-    impl FailedLaunchChild for FakeFailedLaunchChild {
-        fn kill_for_failed_launch(&mut self) -> std::io::Result<()> {
-            self.killed = true;
-            self.kill_error
-                .map_or(Ok(()), |kind| Err(std::io::Error::from(kind)))
-        }
-
-        fn wait_for_failed_launch(&mut self) -> std::io::Result<()> {
-            self.waited = true;
-            self.wait_error
-                .map_or(Ok(()), |kind| Err(std::io::Error::from(kind)))
-        }
-    }
-
     fn config() -> SupervisorConfig {
         SupervisorConfig {
             executable: PathBuf::from("worker"),
@@ -2362,73 +1731,16 @@ mod tests {
     }
 
     #[test]
-    fn containment_failure_kills_and_reaps_before_reporting_start_error() {
-        let mut child = FakeFailedLaunchChild::default();
-        let error = fail_closed_containment(
-            &mut child,
-            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-        );
+    fn debugger_ignores_only_invalid_input_termination_errors() {
+        let invalid_input = std::io::Error::from(std::io::ErrorKind::InvalidInput);
+        let permission_denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
 
-        assert!(child.killed);
-        assert!(child.waited);
-        assert_eq!(error.kind, std::io::ErrorKind::PermissionDenied);
-    }
-
-    #[test]
-    fn containment_cleanup_failure_takes_precedence_over_the_start_error() {
-        let mut child = FakeFailedLaunchChild {
-            kill_error: Some(std::io::ErrorKind::TimedOut),
-            ..FakeFailedLaunchChild::default()
-        };
-        let error = fail_closed_containment(
-            &mut child,
-            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-        );
-
-        assert!(child.killed);
-        assert!(child.waited);
-        assert_eq!(error.kind, std::io::ErrorKind::TimedOut);
-    }
-
-    #[test]
-    fn resume_failure_runs_fail_closed_cleanup_before_reporting_start_error() {
-        let mut child = FakeFailedLaunchChild::default();
-        let result = finish_worker_resume(
-            &mut child,
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
-            cleanup_failed_launch,
-        );
-
-        assert_eq!(
-            result,
-            Err(SupervisorStartError {
-                kind: std::io::ErrorKind::PermissionDenied,
-            })
-        );
-        assert!(child.killed);
-        assert!(child.waited);
-    }
-
-    #[test]
-    fn resume_cleanup_failure_takes_precedence_over_the_resume_error() {
-        let mut child = FakeFailedLaunchChild {
-            wait_error: Some(std::io::ErrorKind::TimedOut),
-            ..FakeFailedLaunchChild::default()
-        };
-        let result = finish_worker_resume(
-            &mut child,
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
-            cleanup_failed_launch,
-        );
-
-        assert_eq!(
-            result,
-            Err(SupervisorStartError {
-                kind: std::io::ErrorKind::TimedOut,
-            })
-        );
-        assert!(child.killed);
-        assert!(child.waited);
+        assert!(!should_report_containment_termination_error(
+            invalid_input.kind()
+        ));
+        assert!(should_report_containment_termination_error(
+            permission_denied.kind()
+        ));
     }
 
     #[test]
