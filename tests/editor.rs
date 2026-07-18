@@ -3,6 +3,7 @@ pub use oxide_ide::{
 };
 use rlox::{RevisionId, SourceDocument, SourceId, SourceSpan, TextPosition};
 
+#[allow(dead_code)]
 #[path = "../src/editor.rs"]
 mod editor;
 
@@ -81,6 +82,26 @@ fn line_count_keeps_empty_and_trailing_source_lines() {
     assert_eq!(trailing.position_at(5).unwrap().column_index, 0);
     assert_eq!(trailing.line_start(2).unwrap().byte_index.0, 5);
     assert_eq!(trailing.line_start(2).unwrap().char_index.0, 5);
+}
+
+#[test]
+fn bounded_text_buffer_counts_bare_carriage_returns_like_model_normalization() {
+    let mut source = String::new();
+    let mut buffer = BoundedTextBuffer::with_limits(&mut source, 1024, 2);
+
+    assert_eq!(buffer.insert_text("one\rtwo\rthree", 0.into()), 0);
+
+    let rejection = buffer
+        .rejection()
+        .expect("three normalized lines exceed the cap");
+    assert_eq!(rejection.limit, SourceGrowthLimit::Lines);
+    assert_eq!(rejection.attempted_lines, 3);
+    assert!(source.is_empty(), "rejected text must be rolled back");
+
+    let mut crlf_source = String::new();
+    let mut crlf_buffer = BoundedTextBuffer::with_limits(&mut crlf_source, 1024, 2);
+    assert_eq!(crlf_buffer.insert_text("one\r\ntwo", 0.into()), 8);
+    assert!(crlf_buffer.rejection().is_none());
 }
 
 #[test]

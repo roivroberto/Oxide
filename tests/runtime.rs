@@ -1,18 +1,17 @@
 use oxide_ide::{
-    ClientCommandId, ClientStartId, ClientSubmission, CloseRequestId, ClosureHealth, CommandIntent,
-    Envelope, EventSequence, ExecutionCommand, ExecutionCommandKind, FileModelEvent,
-    FileOperationId, ModelEffect, ModelEvent, PROTOCOL_VERSION, RequestId, RunBinding, RunId,
-    RunMode, RuntimeCoordinator, RuntimeCoordinatorConfig, RuntimeDispatchError, RuntimeWake,
-    StartIntent, StderrSummary, SubmitError, SupervisorCommand, SupervisorCommandKind,
-    SupervisorConfig, SupervisorDriver, SupervisorEvent, SupervisorFactory, SupervisorModelEvent,
-    SupervisorPollError, SupervisorRun, SupervisorRunMode, SupervisorSource, SupervisorStartError,
-    SupervisorSubmissionId, UiAction, WorkerEvent, WorkerSessionId, WorkerSupervisor, WorkerTarget,
+    ClientCommandId, ClientStartId, ClientSubmission, ClosureHealth, CommandIntent, Envelope,
+    EventSequence, ExecutionCommand, ExecutionCommandKind, ModelEffect, ModelEvent,
+    PROTOCOL_VERSION, RequestId, RunBinding, RunId, RunMode, RuntimeCoordinator,
+    RuntimeCoordinatorConfig, RuntimeDispatchError, RuntimeWake, StartIntent, StderrSummary,
+    SubmitError, SupervisorCommand, SupervisorCommandKind, SupervisorDriver, SupervisorEvent,
+    SupervisorFactory, SupervisorModelEvent, SupervisorPollError, SupervisorRun, SupervisorRunMode,
+    SupervisorStartError, SupervisorSubmissionId, WorkerEvent, WorkerSessionId, WorkerTarget,
     WorkerTerminationReason,
 };
 use rlox::{RevisionId, SourceId};
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Default)]
@@ -31,6 +30,7 @@ struct FakeSupervisorControl {
     submissions: Arc<Mutex<Vec<(SupervisorSubmissionId, SupervisorCommand)>>>,
     submission_results: Arc<Mutex<VecDeque<Result<(), SubmitError>>>>,
     close_count: Arc<Mutex<usize>>,
+    close_gate: Option<CloseGate>,
 }
 
 impl FakeSupervisorControl {
@@ -41,6 +41,14 @@ impl FakeSupervisorControl {
             submissions: Arc::default(),
             submission_results: Arc::default(),
             close_count: Arc::default(),
+            close_gate: None,
+        }
+    }
+
+    fn with_close_gate(session: u64, close_gate: CloseGate) -> Self {
+        Self {
+            close_gate: Some(close_gate),
+            ..Self::new(session)
         }
     }
 
@@ -96,8 +104,54 @@ impl SupervisorDriver for FakeSupervisor {
     }
 
     fn close(&self) -> Result<(), SubmitError> {
+        if let Some(close_gate) = &self.0.close_gate {
+            close_gate.wait_for_release();
+        }
         *self.0.close_count.lock().expect("close count") += 1;
         Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+struct CloseGate(Arc<(Mutex<CloseGateState>, Condvar)>);
+
+#[derive(Default)]
+struct CloseGateState {
+    entered: bool,
+    released: bool,
+}
+
+impl CloseGate {
+    fn wait_for_release(&self) {
+        let (state, changed) = &*self.0;
+        let mut state = state.lock().expect("close gate");
+        state.entered = true;
+        changed.notify_all();
+        while !state.released {
+            state = changed.wait(state).expect("close gate");
+        }
+    }
+
+    fn wait_until_entered(&self) {
+        let (state, changed) = &*self.0;
+        let mut state = state.lock().expect("close gate");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !state.entered {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (next, timeout) = changed.wait_timeout(state, remaining).expect("close gate");
+            state = next;
+            assert!(
+                !timeout.timed_out() || state.entered,
+                "timed out waiting for close gate"
+            );
+        }
+    }
+
+    fn release(&self) {
+        let (state, changed) = &*self.0;
+        let mut state = state.lock().expect("close gate");
+        state.released = true;
+        changed.notify_all();
     }
 }
 
@@ -623,7 +677,7 @@ fn full_gui_event_lane_does_not_starve_close_or_emit_early_wakes() {
 }
 
 #[test]
-fn shutdown_is_asynchronous_and_closes_the_owned_generation() {
+fn shutdown_joins_the_actor_after_closing_the_owned_generation() {
     let control = FakeSupervisorControl::new(11);
     let coordinator = coordinator([control.clone()], WakeCounter::default());
     coordinator
@@ -634,13 +688,58 @@ fn shutdown_is_asynchronous_and_closes_the_owned_generation() {
     wait_for_submission_count(&control, 1);
 
     coordinator.shutdown();
-    wait_until(|| control.close_count() == 1, "shutdown close");
+    assert_eq!(control.close_count(), 1);
     assert!(matches!(
         coordinator.try_dispatch(start_effect(
             ClientStartId::from_raw(2).expect("nonzero start")
         )),
-        Err(RuntimeDispatchError::Closed(_)) | Ok(())
+        Err(RuntimeDispatchError::Closed(_))
     ));
+
+    drop(coordinator);
+    assert_eq!(control.close_count(), 1);
+}
+
+#[test]
+fn drop_joins_the_actor_after_closing_the_owned_generation() {
+    let control = FakeSupervisorControl::new(11);
+    let coordinator = coordinator([control.clone()], WakeCounter::default());
+    coordinator
+        .try_dispatch(start_effect(
+            ClientStartId::from_raw(1).expect("nonzero start"),
+        ))
+        .expect("start queued");
+    wait_for_submission_count(&control, 1);
+
+    drop(coordinator);
+
+    assert_eq!(control.close_count(), 1);
+}
+
+#[test]
+fn shutdown_wait_is_bounded_and_a_later_shutdown_joins_the_actor() {
+    let gate = CloseGate::default();
+    let control = FakeSupervisorControl::with_close_gate(11, gate.clone());
+    let coordinator = coordinator([control.clone()], WakeCounter::default());
+    coordinator
+        .try_dispatch(start_effect(
+            ClientStartId::from_raw(1).expect("nonzero start"),
+        ))
+        .expect("start queued");
+    wait_for_submission_count(&control, 1);
+
+    let started = Instant::now();
+    coordinator.shutdown();
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "shutdown must not wait indefinitely for an uncooperative driver"
+    );
+    gate.wait_until_entered();
+    assert_eq!(control.close_count(), 0);
+
+    gate.release();
+    coordinator.shutdown();
+    assert_eq!(control.close_count(), 1);
 }
 
 fn start_effect(client_start_id: ClientStartId) -> ModelEffect {

@@ -1,2 +1,40 @@
+#include <winver.h>
+
 #define RT_MANIFEST 24
-1 RT_MANIFEST "oxide-ide.exe.manifest"
+#define IDR_MAIN_MANIFEST 1
+#define IDR_VERSION_INFO 1
+#define IDI_APP_ICON 101
+
+IDR_MAIN_MANIFEST RT_MANIFEST "oxide-ide.exe.manifest"
+IDI_APP_ICON ICON "oxide-ide.ico"
+
+IDR_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0x0L
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "Oxide IDE\0"
+      VALUE "FileVersion", "0.1.0.0\0"
+      VALUE "InternalName", "oxide-ide\0"
+      VALUE "OriginalFilename", "oxide-ide.exe\0"
+      VALUE "ProductName", "Oxide IDE\0"
+      VALUE "ProductVersion", "0.1.0.0\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END

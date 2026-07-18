@@ -38,9 +38,7 @@ fn report_visible_startup_error(error: &eframe::Error) {
     if characters.next().is_some() {
         detail.push('…');
     }
-    let message = format!(
-        "{APP_NAME} could not start.\n\n{detail}\n\nCheck Windows and the graphics driver, then try again."
-    );
+    let message = visible_startup_message(&detail);
     eprintln!("{message}");
     let _ = rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
@@ -48,4 +46,24 @@ fn report_visible_startup_error(error: &eframe::Error) {
         .set_description(message)
         .set_buttons(rfd::MessageButtons::Ok)
         .show();
+}
+
+fn visible_startup_message(detail: &str) -> String {
+    format!(
+        "{APP_NAME} could not start.\n\n{detail}\n\nTry again. If the problem repeats, keep this message for troubleshooting."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_message_preserves_the_cause_without_guessing_the_remedy() {
+        let message = visible_startup_message("could not start the runtime coordinator");
+
+        assert!(message.contains("could not start the runtime coordinator"));
+        assert!(!message.contains("graphics driver"));
+        assert!(message.contains("keep this message for troubleshooting"));
+    }
 }

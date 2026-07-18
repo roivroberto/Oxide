@@ -281,7 +281,7 @@ fn supervisor_stops_an_infinite_run_and_reaps_it() {
 }
 
 #[test]
-fn supervisor_can_close_before_loading_a_program() {
+fn worker_waits_for_load_after_hello_and_can_close_cleanly() {
     let supervisor = WorkerSupervisor::launch(config()).expect("launch supervisor");
     loop {
         if let SupervisorEvent::Worker(envelope) = next_event(&supervisor)
@@ -289,6 +289,17 @@ fn supervisor_can_close_before_loading_a_program() {
         {
             break;
         }
+    }
+    let quiet_deadline = Instant::now() + Duration::from_millis(150);
+    while Instant::now() < quiet_deadline {
+        assert!(
+            supervisor
+                .try_recv()
+                .expect("poll idle worker after hello")
+                .is_none(),
+            "worker advanced before a load command was admitted"
+        );
+        thread::sleep(Duration::from_millis(5));
     }
     supervisor.close().expect("request close");
     match next_event(&supervisor) {

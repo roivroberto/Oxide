@@ -337,6 +337,18 @@ fn write_file_atomically_io(path: &Path, contents: &[u8]) -> io::Result<()> {
             "path has no file name",
         ));
     }
+    #[cfg(windows)]
+    let canonical_parent = fs::canonicalize(parent)?;
+    #[cfg(windows)]
+    let parent = canonical_parent.as_path();
+    #[cfg(windows)]
+    let canonical_target = parent.join(path.file_name().expect("file name was validated"));
+    #[cfg(windows)]
+    let target = canonical_target.as_path();
+    #[cfg(not(windows))]
+    let target = path;
+    #[cfg(windows)]
+    let commit_mode = windows_commit_mode(target)?;
     #[cfg(unix)]
     let existing_permissions = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Some(metadata.permissions()),
@@ -354,9 +366,32 @@ fn write_file_atomically_io(path: &Path, contents: &[u8]) -> io::Result<()> {
     }
     temporary_file.sync_all()?;
     drop(temporary_file);
-    commit_temp(pending.path(), path)?;
+    #[cfg(windows)]
+    commit_temp(pending.path(), target, commit_mode)?;
+    #[cfg(not(windows))]
+    commit_temp(pending.path(), target)?;
     pending.committed = true;
     Ok(())
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum WindowsCommitMode {
+    CreateNew,
+    ReplaceExisting,
+}
+
+#[cfg(windows)]
+fn windows_commit_mode(target: &Path) -> io::Result<WindowsCommitMode> {
+    match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(WindowsCommitMode::ReplaceExisting),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "save target is not a regular file",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(WindowsCommitMode::CreateNew),
+        Err(error) => Err(error),
+    }
 }
 
 fn create_sibling_temp(parent: &Path) -> io::Result<(PathBuf, File)> {
@@ -386,15 +421,118 @@ fn commit_temp(temporary: &Path, target: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn commit_temp(temporary: &Path, target: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(target) {
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "safe replacement of an existing Windows file is unavailable",
-        )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::rename(temporary, target),
-        Err(error) => Err(error),
+fn commit_temp(temporary: &Path, target: &Path, commit_mode: WindowsCommitMode) -> io::Result<()> {
+    match commit_mode {
+        WindowsCommitMode::CreateNew => move_new_file(temporary, target),
+        WindowsCommitMode::ReplaceExisting => replace_existing_file(temporary, target),
     }
+}
+
+#[cfg(windows)]
+fn move_new_file(temporary: &Path, target: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let temporary = windows_path_utf16(temporary)?;
+    let target = windows_path_utf16(target)?;
+    // SAFETY: both paths are NUL-terminated UTF-16 buffers that remain alive
+    // for the duration of the call.
+    if unsafe { MoveFileExW(temporary.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn replace_existing_file(temporary: &Path, target: &Path) -> io::Result<()> {
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    let parent = target
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let mut backup = reserve_sibling_backup(parent)?;
+    let temporary_wide = windows_path_utf16(temporary)?;
+    let target_wide = windows_path_utf16(target)?;
+    let backup_wide = windows_path_utf16(backup.path())?;
+    // No ignore flags are used: failing to merge attributes or ACLs must fail
+    // the save instead of silently weakening the destination metadata.
+    // SAFETY: all paths are live, NUL-terminated UTF-16 buffers. The reserved
+    // pointer parameters are null as required by ReplaceFileW.
+    if unsafe {
+        ReplaceFileW(
+            target_wide.as_ptr(),
+            temporary_wide.as_ptr(),
+            backup_wide.as_ptr(),
+            0,
+            ptr::null(),
+            ptr::null(),
+        )
+    } != 0
+    {
+        backup.remove()?;
+        return Ok(());
+    }
+
+    let error = io::Error::last_os_error();
+    // In this failure mode Windows has moved the original to the requested
+    // backup name but has not installed the replacement. Restore without
+    // overwriting a destination that may have appeared concurrently. If the
+    // restoration itself fails, the recovery file is deliberately retained.
+    if error.raw_os_error() == Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 as i32) {
+        match fs::symlink_metadata(target) {
+            Err(target_error) if target_error.kind() == io::ErrorKind::NotFound => {
+                let _ = move_new_file(backup.path(), target);
+            }
+            _ => {}
+        }
+    }
+    Err(error)
+}
+
+#[cfg(windows)]
+fn reserve_sibling_backup(parent: &Path) -> io::Result<PendingBackup> {
+    for _ in 0..TEMP_ATTEMPTS {
+        let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".oxide-recovery-{}-{sequence}.bak",
+            std::process::id()
+        ));
+        match fs::symlink_metadata(&path) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(PendingBackup::new(path));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique recovery file",
+    ))
+}
+
+#[cfg(windows)]
+fn windows_path_utf16(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows save path is not absolute",
+        ));
+    }
+    let mut encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if encoded.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path contains a NUL character",
+        ));
+    }
+    encoded.push(0);
+    Ok(encoded)
 }
 
 struct PendingTemp {
@@ -423,6 +561,61 @@ impl Drop for PendingTemp {
     }
 }
 
+#[cfg(windows)]
+struct PendingBackup {
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+#[cfg(any(windows, test))]
+fn remove_recovery_file_with(
+    path: &Path,
+    mut remove: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match remove(path) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {}
+    }
+    match remove(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+impl PendingBackup {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            remove_on_drop: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn remove(&mut self) -> io::Result<()> {
+        self.remove_on_drop = true;
+        let result = remove_recovery_file_with(&self.path, |path| fs::remove_file(path));
+        if result.is_ok() {
+            self.remove_on_drop = false;
+        }
+        result
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PendingBackup {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn classify_io_error(error: &io::Error) -> FileFailureKind {
     match error.kind() {
         io::ErrorKind::NotFound => FileFailureKind::NotFound,
@@ -430,5 +623,46 @@ fn classify_io_error(error: &io::Error) -> FileFailureKind {
         io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => FileFailureKind::InvalidData,
         io::ErrorKind::AlreadyExists => FileFailureKind::AlreadyExists,
         _ => FileFailureKind::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn committed_recovery_cleanup_retries_once() {
+        let attempts = Cell::new(0);
+
+        remove_recovery_file_with(Path::new("recovery.bak"), |_| {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            if attempt == 1 {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "recovery file is still in use",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("a transient cleanup failure should be retried");
+
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn committed_recovery_cleanup_failure_is_reported() {
+        let failure = remove_recovery_file_with(Path::new("recovery.bak"), |_| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recovery file is still in use",
+            ))
+        })
+        .expect_err("cleanup failure must remain visible");
+
+        assert_eq!(failure.kind(), io::ErrorKind::PermissionDenied);
     }
 }

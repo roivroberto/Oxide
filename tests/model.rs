@@ -639,7 +639,7 @@ fn save_as_is_transactional_and_preserves_native_unicode_path() {
         panic!("expected save picker");
     };
     let operation_id = *operation_id;
-    let path = PathBuf::from(r"C:\Users\Roi\Mga Programa\wika-語.lox");
+    let path = PathBuf::from(r"C:\Users\Student\Mga Programa\wika-語.lox");
     let effects = apply_event(
         &mut model,
         ModelEvent::File(FileModelEvent::SavePicked {
@@ -1023,7 +1023,7 @@ fn exit_does_not_replace_an_in_flight_save() {
         &mut model,
         ModelEvent::File(FileModelEvent::SavePicked {
             operation_id,
-            path: Some(PathBuf::from(r"C:\Users\Roi\in-flight.lox")),
+            path: Some(PathBuf::from(r"C:\Users\Student\in-flight.lox")),
         }),
     );
     assert!(matches!(
@@ -1113,7 +1113,7 @@ fn open_rejects_adapter_data_larger_than_the_declared_limit() {
         panic!("expected open picker");
     };
     let operation_id = *operation_id;
-    let path = PathBuf::from(r"C:\Users\Roi\too-large.lox");
+    let path = PathBuf::from(r"C:\Users\Student\too-large.lox");
     let effects = apply_event(
         &mut model,
         ModelEvent::File(FileModelEvent::OpenPicked {
@@ -1166,7 +1166,7 @@ fn open_rejects_pathological_line_counts_without_replacing_the_document() {
         &mut model,
         ModelEvent::File(FileModelEvent::OpenPicked {
             operation_id,
-            path: Some(PathBuf::from(r"C:\Users\Roi\too-many-lines.lox")),
+            path: Some(PathBuf::from(r"C:\Users\Student\too-many-lines.lox")),
         }),
     );
     apply_event(
@@ -1590,7 +1590,7 @@ fn stale_and_failed_open_completions_preserve_the_existing_document() {
     };
     let operation_id = *operation_id;
     let stale = oxide_ide::FileOperationId::from_raw(operation_id.get() + 1).unwrap();
-    let path = PathBuf::from(r"C:\Users\Roi\lumang-語.lox");
+    let path = PathBuf::from(r"C:\Users\Student\lumang-語.lox");
 
     let before = model.clone();
     assert!(
@@ -1664,7 +1664,7 @@ fn stale_and_duplicate_write_completions_are_inert() {
     };
     let operation_id = *operation_id;
     let stale = oxide_ide::FileOperationId::from_raw(operation_id.get() + 1).unwrap();
-    let path = PathBuf::from(r"C:\Users\Roi\save-語.lox");
+    let path = PathBuf::from(r"C:\Users\Student\save-語.lox");
     let before = model.clone();
     apply_event(
         &mut model,
@@ -1699,7 +1699,7 @@ fn stale_and_duplicate_write_completions_are_inert() {
         &mut model,
         ModelEvent::File(FileModelEvent::SavePicked {
             operation_id,
-            path: Some(PathBuf::from(r"C:\Users\Roi\wrong.lox")),
+            path: Some(PathBuf::from(r"C:\Users\Student\wrong.lox")),
         }),
     );
     assert_eq!(model, writing);
@@ -1737,7 +1737,7 @@ fn invalid_utf8_open_preserves_the_current_document() {
         &mut model,
         ModelEvent::File(FileModelEvent::OpenPicked {
             operation_id,
-            path: Some(PathBuf::from(r"C:\Users\Roi\invalid-語.lox")),
+            path: Some(PathBuf::from(r"C:\Users\Student\invalid-語.lox")),
         }),
     );
     apply_event(

@@ -1,8 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
-use std::thread;
+use std::sync::{Arc, Mutex, TryLockError, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::{
@@ -14,6 +14,7 @@ use super::{
 };
 
 const MAX_REQUESTS_PER_TURN: usize = 32;
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeCoordinatorConfig {
@@ -128,6 +129,12 @@ pub struct RuntimeCoordinator {
     requests: mpsc::SyncSender<RuntimeRequest>,
     events: mpsc::Receiver<ModelEvent>,
     shutdown: Arc<AtomicBool>,
+    actor: Mutex<RuntimeActorThread>,
+}
+
+struct RuntimeActorThread {
+    handle: Option<JoinHandle<()>>,
+    stopped: mpsc::Receiver<()>,
 }
 
 impl RuntimeCoordinator {
@@ -161,9 +168,10 @@ impl RuntimeCoordinator {
         }
         let (request_tx, request_rx) = mpsc::sync_channel(config.request_capacity);
         let (event_tx, event_rx) = mpsc::sync_channel(config.event_capacity);
+        let (actor_stopped_tx, actor_stopped_rx) = mpsc::sync_channel(1);
         let shutdown = Arc::new(AtomicBool::new(false));
         let actor_shutdown = shutdown.clone();
-        thread::Builder::new()
+        let actor_handle = thread::Builder::new()
             .name("oxide-runtime-coordinator".to_owned())
             .spawn(move || {
                 runtime_actor(
@@ -174,12 +182,17 @@ impl RuntimeCoordinator {
                     actor_shutdown,
                     config.poll_interval,
                 );
+                let _ = actor_stopped_tx.try_send(());
             })
             .map_err(|error| RuntimeStartError { kind: error.kind() })?;
         Ok(Self {
             requests: request_tx,
             events: event_rx,
             shutdown,
+            actor: Mutex::new(RuntimeActorThread {
+                handle: Some(actor_handle),
+                stopped: actor_stopped_rx,
+            }),
         })
     }
 
@@ -213,6 +226,26 @@ impl RuntimeCoordinator {
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         let _ = self.requests.try_send(RuntimeRequest::Shutdown);
+        self.join_actor_bounded();
+    }
+
+    fn join_actor_bounded(&self) {
+        let mut actor = match self.actor.try_lock() {
+            Ok(actor) => actor,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        if actor.handle.is_none() {
+            return;
+        }
+        match actor.stopped.recv_timeout(SHUTDOWN_JOIN_TIMEOUT) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(handle) = actor.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
     }
 }
 

@@ -520,6 +520,25 @@ fn essential_controls_remain_on_screen_at_scaled_classroom_sizes() {
 }
 
 #[test]
+fn line_gutter_exposes_concise_accessibility_metadata_at_the_line_limit() {
+    let mut model = AppModel::new();
+    let stamp = model.document().unwrap().stamp();
+    apply_event(
+        &mut model,
+        ModelEvent::Ui(UiAction::Edit {
+            document: stamp,
+            text: "\n".repeat(oxide_ide::MAX_SOURCE_LINES - 1),
+        }),
+    );
+    let harness = Harness::builder()
+        .with_size(eframe::egui::vec2(683.0, 384.0))
+        .build_eframe(move |_| OxideApp::headless(model));
+
+    let gutter = harness.get_by_label("Line number gutter");
+    assert_eq!(gutter.value().as_deref(), Some("Line number gutter"));
+}
+
+#[test]
 fn horizontal_editor_scroll_keeps_the_line_gutter_fixed() {
     let mut model = AppModel::new();
     let stamp = model.document().unwrap().stamp();
@@ -534,7 +553,7 @@ fn horizontal_editor_scroll_keeps_the_line_gutter_fixed() {
     let mut harness = Harness::builder()
         .with_size(eframe::egui::vec2(683.0, 384.0))
         .build_eframe(move |_| OxideApp::headless(model));
-    let initial_gutter_x = harness.get_by_value("  1").rect().left();
+    let initial_gutter_x = harness.get_by_label("Line number gutter").rect().left();
 
     harness
         .get_by_role(eframe::egui::accesskit::Role::MultilineTextInput)
@@ -548,7 +567,10 @@ fn horizontal_editor_scroll_keeps_the_line_gutter_fixed() {
     });
     harness.run();
 
-    assert_eq!(harness.get_by_value("  1").rect().left(), initial_gutter_x);
+    assert_eq!(
+        harness.get_by_label("Line number gutter").rect().left(),
+        initial_gutter_x
+    );
 }
 
 #[test]
@@ -569,7 +591,7 @@ fn moving_the_caret_to_the_last_line_scrolls_the_shared_vertical_editor() {
     let mut harness = Harness::builder()
         .with_size(eframe::egui::vec2(640.0, 360.0))
         .build_eframe(move |_| OxideApp::headless(model));
-    let initial_gutter_top = harness.get_by_label_contains("    1\n    2").rect().top();
+    let initial_gutter_top = harness.get_by_label("Line number gutter").rect().top();
     harness
         .get_by_role(eframe::egui::accesskit::Role::MultilineTextInput)
         .focus();
@@ -579,7 +601,7 @@ fn moving_the_caret_to_the_last_line_scrolls_the_shared_vertical_editor() {
     harness.run();
     harness.run();
 
-    assert!(harness.get_by_label_contains("    1\n    2").rect().top() < initial_gutter_top - 50.0);
+    assert!(harness.get_by_label("Line number gutter").rect().top() < initial_gutter_top - 50.0);
 }
 
 #[test]
@@ -725,4 +747,48 @@ fn new_input_request_reveals_output_and_focuses_the_input_field() {
         eframe::egui::vec2(683.0, 384.0),
     );
     assert!(screen.contains(input.rect().min) && screen.contains(input.rect().max));
+}
+
+#[test]
+fn diagnostics_and_output_reveal_their_console_tabs() {
+    let (model, run) = running_model(RunMode::Run);
+    let span = debug_span(run);
+    let diagnostic = WireDiagnostic {
+        phase: DiagnosticPhase::Runtime,
+        severity: DiagnosticSeverity::Error,
+        code: "runtime.test".to_owned(),
+        code_truncated: false,
+        message: "boom".to_owned(),
+        message_truncated: false,
+        span,
+        frames: Vec::new(),
+        frames_truncated: false,
+    };
+    let mut harness = Harness::builder()
+        .with_size(eframe::egui::vec2(1_100.0, 700.0))
+        .build_eframe(move |_| OxideApp::headless(model));
+
+    harness
+        .state_mut()
+        .queue_event(worker_event(run, 2, WorkerEvent::Diagnostic { diagnostic }));
+    harness.run();
+    harness.run();
+    assert_eq!(
+        harness.get_by_label("Problems").accesskit_node().toggled(),
+        Some(eframe::egui::accesskit::Toggled::True)
+    );
+
+    harness.state_mut().queue_event(worker_event(
+        run,
+        3,
+        WorkerEvent::Output {
+            text: "recovered\n".to_owned(),
+        },
+    ));
+    harness.run();
+    harness.run();
+    assert_eq!(
+        harness.get_by_label("Output").accesskit_node().toggled(),
+        Some(eframe::egui::accesskit::Toggled::True)
+    );
 }

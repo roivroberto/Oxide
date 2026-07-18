@@ -151,9 +151,11 @@ enum InspectorTab {
 }
 
 pub fn run_visible() -> eframe::Result<()> {
+    let icon = load_app_icon()?;
     let viewport = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
         .with_app_id("oxide-ide")
+        .with_icon(icon)
         .with_inner_size([1_100.0, 700.0])
         .with_min_inner_size([640.0, 360.0])
         .with_resizable(true)
@@ -173,6 +175,11 @@ pub fn run_visible() -> eframe::Result<()> {
             Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     )
+}
+
+fn load_app_icon() -> eframe::Result<egui::IconData> {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/oxide-ide.png"))
+        .map_err(|error| eframe::Error::AppCreation(Box::new(error)))
 }
 
 impl OxideApp {
@@ -216,13 +223,24 @@ impl OxideApp {
 
     pub fn native(cc: &eframe::CreationContext<'_>) -> io::Result<Self> {
         let supervisor = SupervisorConfig::current_executable().map_err(|error| {
-            io::Error::new(error.kind, "could not locate the Oxide IDE executable")
+            io::Error::new(
+                error.kind,
+                format!(
+                    "could not locate the Oxide IDE executable ({:?})",
+                    error.kind
+                ),
+            )
         })?;
         let runtime_context = cc.egui_ctx.clone();
         let runtime = RuntimeCoordinator::spawn(supervisor, move || {
             runtime_context.request_repaint();
         })
-        .map_err(|error| io::Error::new(error.kind, "could not start the runtime coordinator"))?;
+        .map_err(|error| {
+            io::Error::new(
+                error.kind,
+                format!("could not start the runtime coordinator ({:?})", error.kind),
+            )
+        })?;
         let file_context = cc.egui_ctx.clone();
         let (files, file_events) = FileExecutor::spawn(move || {
             file_context.request_repaint();
@@ -383,6 +401,11 @@ impl OxideApp {
             let Some(event) = self.queued_events.pop_front() else {
                 break;
             };
+            let previous_state = self.model.execution_state();
+            let previous_output_bytes = self.model.program_output().len();
+            let previous_output_truncated = self.model.output_was_truncated();
+            let previous_problem_count = self.model.problems().len();
+            let previous_problems_truncated = self.model.problems_were_truncated();
             if matches!(
                 &event,
                 ModelEvent::Supervisor(SupervisorModelEvent::RuntimeDisconnected)
@@ -391,6 +414,24 @@ impl OxideApp {
             }
             self.pending_effects
                 .extend(apply_event(&mut self.model, event));
+            let revealed_problem = self.model.problems().len() > previous_problem_count
+                || self.model.problems_were_truncated() && !previous_problems_truncated
+                || self.model.execution_state() == ExecutionViewState::Faulted
+                    && previous_state != ExecutionViewState::Faulted;
+            let revealed_output = self.model.program_output().len() != previous_output_bytes
+                || self.model.output_was_truncated() && !previous_output_truncated
+                || previous_state == ExecutionViewState::Starting
+                    && matches!(
+                        self.model.execution_state(),
+                        ExecutionViewState::Running | ExecutionViewState::Paused
+                    );
+            if revealed_problem {
+                self.console_tab = ConsoleTab::Problems;
+                self.console_expanded = true;
+            } else if revealed_output {
+                self.console_tab = ConsoleTab::Output;
+                self.console_expanded = true;
+            }
             reduced += 1;
         }
         self.reconcile_editor_buffer();
@@ -518,6 +559,7 @@ impl OxideApp {
             self.editor_mapper = None;
             self.editor_cursor_range = None;
             self.editor_text.clear();
+            self.editor_notice = None;
             return;
         };
         if self.editor_stamp != Some(document.stamp()) {
@@ -525,6 +567,7 @@ impl OxideApp {
             self.editor_mapper = None;
             self.editor_cursor_range = None;
             self.editor_text = document.text().to_owned();
+            self.editor_notice = None;
         }
     }
 
@@ -1135,13 +1178,27 @@ impl OxideApp {
                             },
                             SourceMapper::line_count,
                         );
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(gutter_text(line_count, marker_plan)).monospace(),
-                            )
-                            .selectable(false),
+                        let gutter = egui::Label::new(
+                            RichText::new(gutter_text(line_count, marker_plan)).monospace(),
                         )
-                        .on_hover_text("Line numbers and source markers");
+                        .selectable(false);
+                        let (gutter_position, gutter_galley, gutter_response) =
+                            gutter.layout_in_ui(ui);
+                        gutter_response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Label,
+                                ui.is_enabled(),
+                                "Line number gutter",
+                            )
+                        });
+                        if ui.is_rect_visible(gutter_response.rect) {
+                            ui.painter().galley(
+                                gutter_position,
+                                gutter_galley,
+                                ui.visuals().text_color(),
+                            );
+                        }
+                        gutter_response.on_hover_text("Line numbers and source markers");
                         let mut vertical_scroll_target = None;
                         ScrollArea::horizontal()
                             .id_salt((
@@ -1225,6 +1282,9 @@ impl OxideApp {
                                 }
                                 let response =
                                     output.response.response.labelled_by(source_label.id);
+                                if rejection.is_none() && response.changed() {
+                                    self.editor_notice = None;
+                                }
                                 let cursor_changed =
                                     self.editor_cursor_range != output.cursor_range;
                                 self.editor_cursor_range = output.cursor_range;
@@ -1660,6 +1720,29 @@ fn action(
     }
 }
 
+fn key(key: Key) -> Option<KeyboardShortcut> {
+    Some(KeyboardShortcut::new(Modifiers::NONE, key))
+}
+
+fn ctrl(key: Key) -> Option<KeyboardShortcut> {
+    Some(KeyboardShortcut::new(Modifiers::CTRL, key))
+}
+
+fn shift(key: Key) -> Option<KeyboardShortcut> {
+    Some(KeyboardShortcut::new(Modifiers::SHIFT, key))
+}
+
+fn ctrl_shift(key: Key) -> Option<KeyboardShortcut> {
+    Some(KeyboardShortcut::new(
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::NONE
+        },
+        key,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1716,27 +1799,36 @@ mod tests {
         assert_eq!(app.pump_events(32), 1);
         assert_eq!(app.model.status(), Some(&ModelStatus::RuntimeDisconnected));
     }
-}
 
-fn key(key: Key) -> Option<KeyboardShortcut> {
-    Some(KeyboardShortcut::new(Modifiers::NONE, key))
-}
+    #[test]
+    fn reconciling_an_accepted_edit_clears_the_previous_editor_notice() {
+        let mut app = OxideApp::headless(AppModel::new());
+        let stamp = app
+            .model
+            .document()
+            .expect("headless app starts with a document")
+            .stamp();
+        app.editor_notice = Some("old warning".to_owned());
 
-fn ctrl(key: Key) -> Option<KeyboardShortcut> {
-    Some(KeyboardShortcut::new(Modifiers::CTRL, key))
-}
+        let effects = apply_event(
+            &mut app.model,
+            ModelEvent::Ui(UiAction::Edit {
+                document: stamp,
+                text: "print 1;".to_owned(),
+            }),
+        );
+        assert!(effects.is_empty());
+        app.reconcile_editor_buffer();
 
-fn shift(key: Key) -> Option<KeyboardShortcut> {
-    Some(KeyboardShortcut::new(Modifiers::SHIFT, key))
-}
+        assert!(app.editor_notice.is_none());
+    }
 
-fn ctrl_shift(key: Key) -> Option<KeyboardShortcut> {
-    Some(KeyboardShortcut::new(
-        Modifiers {
-            ctrl: true,
-            shift: true,
-            ..Modifiers::NONE
-        },
-        key,
-    ))
+    #[test]
+    fn embedded_app_icon_decodes_to_square_rgba_pixels() {
+        let icon = load_app_icon().expect("embedded application icon should decode");
+
+        assert_eq!(icon.width, icon.height);
+        assert!(icon.width >= 256);
+        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+    }
 }

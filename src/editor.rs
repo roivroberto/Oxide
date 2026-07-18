@@ -92,13 +92,13 @@ impl TextBuffer for BoundedTextBuffer<'_> {
         }
         let current_bytes = self.text.len();
         let attempted_bytes = current_bytes.saturating_add(text.len());
-        let attempted_lines = self
-            .text
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count()
-            .saturating_add(1)
-            .saturating_add(text.bytes().filter(|byte| *byte == b'\n').count());
+        let insertion_byte = self.byte_index_from_char_index(char_index).0;
+        let attempted_lines = normalized_line_count(
+            self.text[..insertion_byte]
+                .chars()
+                .chain(text.chars())
+                .chain(self.text[insertion_byte..].chars()),
+        );
         let bytes_exceeded = current_bytes
             .checked_add(text.len())
             .is_none_or(|size| size > self.max_bytes);
@@ -148,6 +148,28 @@ impl TextBuffer for BoundedTextBuffer<'_> {
     fn type_id(&self) -> std::any::TypeId {
         std::any::TypeId::of::<BoundedTextBuffer<'static>>()
     }
+}
+
+fn normalized_line_count(characters: impl Iterator<Item = char>) -> usize {
+    let mut lines = 1usize;
+    let mut previous_was_carriage_return = false;
+    for character in characters {
+        match character {
+            '\r' => {
+                lines = lines.saturating_add(1);
+                previous_was_carriage_return = true;
+            }
+            '\n' if previous_was_carriage_return => {
+                previous_was_carriage_return = false;
+            }
+            '\n' => {
+                lines = lines.saturating_add(1);
+                previous_was_carriage_return = false;
+            }
+            _ => previous_was_carriage_return = false,
+        }
+    }
+    lines
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
