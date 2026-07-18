@@ -106,6 +106,10 @@ impl LineCodec {
             self.write_poisoned = true;
             return Err(EncodeError::Io(error.kind()));
         }
+        if let Err(error) = writer.flush() {
+            self.write_poisoned = true;
+            return Err(EncodeError::Io(error.kind()));
+        }
         Ok(payload_len)
     }
 

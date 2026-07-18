@@ -10,6 +10,9 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_DISPLAY_NAME_BYTES: usize = 4 * 1024;
 pub const MAX_WIRE_DOCUMENT_JSON_BYTES: usize = MAX_PAYLOAD_BYTES - 64 * 1024;
+pub const MAX_OUTPUT_CHUNK_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_RUN_OUTPUT_FRAME_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_CONTROL_TEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

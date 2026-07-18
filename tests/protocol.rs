@@ -3,9 +3,9 @@ use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use oxide_ide::{
     Command, CommandStreamValidator, DecodeError, EncodeError, Envelope, EventSequence, LineCodec,
     MAX_DIAGNOSTIC_CODE_BYTES, MAX_DIAGNOSTIC_FRAMES, MAX_DIAGNOSTIC_FUNCTION_BYTES,
-    MAX_DIAGNOSTIC_MESSAGE_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION, RequestId, RunId,
-    StreamValidationError, WireDiagnostic, WireDocument, WireDocumentError, WireRuntimeFrame,
-    WorkerEvent, WorkerEventStreamValidator, WorkerSessionId,
+    MAX_DIAGNOSTIC_MESSAGE_BYTES, MAX_OUTPUT_CHUNK_TEXT_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION,
+    RequestId, RunId, StreamValidationError, WireDiagnostic, WireDocument, WireDocumentError,
+    WireRuntimeFrame, WorkerEvent, WorkerEventStreamValidator, WorkerSessionId,
 };
 use rlox::{
     ActivationId, BindingId, BindingSnapshot, DebugPointId, DebugValue, Diagnostic,
@@ -120,6 +120,34 @@ fn event_envelope(sequence: u64, request: u64, payload: WorkerEvent) -> Envelope
         sequence: EventSequence(sequence),
         payload,
     }
+}
+
+#[test]
+fn output_text_has_a_fixed_wire_chunk_limit() {
+    let maximum = event_envelope(
+        2,
+        1,
+        WorkerEvent::Output {
+            text: "x".repeat(MAX_OUTPUT_CHUNK_TEXT_BYTES),
+        },
+    );
+    assert!(
+        LineCodec::new()
+            .write_worker_event(&mut Vec::new(), &maximum)
+            .is_ok()
+    );
+
+    let oversized = event_envelope(
+        2,
+        1,
+        WorkerEvent::Output {
+            text: "x".repeat(MAX_OUTPUT_CHUNK_TEXT_BYTES + 1),
+        },
+    );
+    assert_eq!(
+        LineCodec::new().write_worker_event(&mut Vec::new(), &oversized),
+        Err(EncodeError::InvalidEnvelope)
+    );
 }
 
 fn round_trip<T>(value: &T)
@@ -758,12 +786,30 @@ fn encode_is_atomic_before_external_io_and_poisoned_after_partial_io() {
     );
     assert_eq!(
         codec.write_worker_event(&mut destination, &oversized),
-        Err(EncodeError::Oversized)
+        Err(EncodeError::InvalidEnvelope)
     );
     assert_eq!(destination, b"prefix");
 
     let valid = command_envelope(1, 1, Command::Pause);
     let mut writer = FailAfter::new(8);
+    assert_eq!(
+        codec.write_command(&mut writer, &valid),
+        Err(EncodeError::Io(io::ErrorKind::BrokenPipe))
+    );
+    let written = writer.bytes.len();
+    assert!(written > 0);
+    assert_eq!(
+        codec.write_command(&mut writer, &valid),
+        Err(EncodeError::Poisoned)
+    );
+    assert_eq!(writer.bytes.len(), written);
+}
+
+#[test]
+fn flush_failure_poisons_future_writes() {
+    let valid = command_envelope(1, 1, Command::Pause);
+    let mut writer = FlushFails { bytes: Vec::new() };
+    let mut codec = LineCodec::new();
     assert_eq!(
         codec.write_command(&mut writer, &valid),
         Err(EncodeError::Io(io::ErrorKind::BrokenPipe))
@@ -1168,6 +1214,21 @@ fn maximum_wire_diagnostic(source_id: u64, revision: u64) -> WireDiagnostic {
 struct FailAfter {
     remaining: usize,
     bytes: Vec<u8>,
+}
+
+struct FlushFails {
+    bytes: Vec<u8>,
+}
+
+impl Write for FlushFails {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush failed"))
+    }
 }
 
 impl FailAfter {

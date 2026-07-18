@@ -4,11 +4,10 @@ use rlox::{
 };
 
 use super::{
-    Command, Envelope, EventSequence, PROTOCOL_VERSION, RequestId, RunId, WorkerEvent,
-    WorkerSessionId,
+    Command, Envelope, EventSequence, MAX_CONTROL_TEXT_BYTES, MAX_OUTPUT_CHUNK_TEXT_BYTES,
+    PROTOCOL_VERSION, RequestId, RunId, WorkerEvent, WorkerSessionId,
 };
 
-const MAX_CONTROL_TEXT_BYTES: usize = 64 * 1024;
 const MAX_REJECTION_CODE_BYTES: usize = 128;
 const MAX_REJECTION_MESSAGE_BYTES: usize = 16 * 1024;
 
@@ -274,7 +273,12 @@ fn validate_event_payload(
 ) -> Result<(), StreamValidationError> {
     match event {
         WorkerEvent::Hello | WorkerEvent::CommandRejected { .. } => {}
-        WorkerEvent::Output { .. } | WorkerEvent::OutputTruncated | WorkerEvent::Completed => {}
+        WorkerEvent::Output { text } => {
+            if text.len() > MAX_OUTPUT_CHUNK_TEXT_BYTES {
+                return Err(StreamValidationError::InvalidPayload);
+            }
+        }
+        WorkerEvent::OutputTruncated | WorkerEvent::Completed => {}
         WorkerEvent::InputRequested { prompt } => {
             if prompt.len() > MAX_CONTROL_TEXT_BYTES {
                 return Err(StreamValidationError::InvalidPayload);

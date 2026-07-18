@@ -10,7 +10,8 @@ pub use diagnostic::{
     WireRuntimeFrame,
 };
 pub use types::{
-    Command, Envelope, EventSequence, MAX_DISPLAY_NAME_BYTES, MAX_PAYLOAD_BYTES,
+    Command, Envelope, EventSequence, MAX_CONTROL_TEXT_BYTES, MAX_DISPLAY_NAME_BYTES,
+    MAX_OUTPUT_CHUNK_TEXT_BYTES, MAX_PAYLOAD_BYTES, MAX_RUN_OUTPUT_FRAME_BYTES,
     MAX_WIRE_DOCUMENT_JSON_BYTES, PROTOCOL_VERSION, RequestId, RunId, WireDocument,
     WireDocumentError, WorkerEvent, WorkerSessionId,
 };
