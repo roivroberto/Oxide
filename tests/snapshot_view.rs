@@ -1,7 +1,7 @@
 use oxide_ide::{
     EventSequence, RunBinding, RunId, SnapshotKey, SnapshotProvenance, WorkerSessionId,
 };
-use rlox::{
+use rlox_protocol::{
     ActivationId, BindingId, BindingSnapshot, DebugValue, FrameSnapshot, RevisionId, SourceId,
     SourceSpan, TextPosition, ValueKind,
 };

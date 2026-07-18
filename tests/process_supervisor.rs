@@ -10,7 +10,12 @@ use oxide_ide::{
 
 fn config() -> SupervisorConfig {
     SupervisorConfig {
-        executable: PathBuf::from(env!("CARGO_BIN_EXE_oxide-ide")),
+        executable: std::env::current_exe()
+            .expect("resolve test executable")
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("Cargo target profile directory")
+            .join(if cfg!(windows) { "rlox.exe" } else { "rlox" }),
         handshake_timeout: Duration::from_secs(5),
         stop_timeout: Duration::from_secs(5),
         shutdown_timeout: Duration::from_secs(5),

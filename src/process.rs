@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rlox::{PauseReason, RevisionId, SnapshotReason, SourceId};
+use rlox_protocol::{PauseReason, RevisionId, SnapshotReason, SourceId};
 
-use crate::protocol::{
+use rlox_protocol::{
     Command, CommandStreamValidator, DecodeError, EncodeError, Envelope, EventSequence, LineCodec,
     MAX_CONTROL_TEXT_BYTES, MAX_PAYLOAD_BYTES, MAX_RUN_OUTPUT_FRAME_BYTES, PROTOCOL_VERSION,
     RequestId, RunId, StreamValidationError, WireDocument, WorkerEvent, WorkerEventStreamValidator,
@@ -88,7 +88,7 @@ mod worker_containment {
         SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_SUSPENDED, GetProcessIdOfThread, OpenThread, ResumeThread,
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, GetProcessIdOfThread, OpenThread, ResumeThread,
         THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME, WaitForSingleObject,
     };
 
@@ -142,7 +142,7 @@ mod worker_containment {
         }
 
         pub(super) fn prepare_command(command: &mut Command) {
-            command.creation_flags(CREATE_SUSPENDED);
+            command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
         }
 
         pub(super) fn resume(&self, child: &Child) -> io::Result<()> {
@@ -553,9 +553,15 @@ pub struct SupervisorConfig {
 }
 
 impl SupervisorConfig {
-    pub fn current_executable() -> Result<Self, SupervisorStartError> {
-        let executable =
+    pub fn sibling_rlox() -> Result<Self, SupervisorStartError> {
+        let current =
             std::env::current_exe().map_err(|error| SupervisorStartError { kind: error.kind() })?;
+        let executable = current
+            .parent()
+            .ok_or(SupervisorStartError {
+                kind: std::io::ErrorKind::NotFound,
+            })?
+            .join(if cfg!(windows) { "rlox.exe" } else { "rlox" });
         Ok(Self {
             executable,
             handshake_timeout: Duration::from_secs(5),
@@ -1001,7 +1007,7 @@ impl WorkerSupervisor {
             WorkerJob::create().map_err(|error| SupervisorStartError { kind: error.kind() })?;
         let mut command = ProcessCommand::new(&config.executable);
         command
-            .args(["--worker", "--worker-session", &session.0.to_string()])
+            .args(["--debug-worker", "--worker-session", &session.0.to_string()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

@@ -222,7 +222,7 @@ impl OxideApp {
     }
 
     pub fn native(cc: &eframe::CreationContext<'_>) -> io::Result<Self> {
-        let supervisor = SupervisorConfig::current_executable().map_err(|error| {
+        let supervisor = SupervisorConfig::sibling_rlox().map_err(|error| {
             io::Error::new(
                 error.kind,
                 format!(
@@ -1475,9 +1475,9 @@ fn show_binding_section(
     ui: &mut egui::Ui,
     title: &'static str,
     snapshot: crate::SnapshotKey,
-    activation: rlox::ActivationId,
+    activation: rlox_protocol::ActivationId,
     scope: BindingScope,
-    bindings: &[rlox::BindingSnapshot],
+    bindings: &[rlox_protocol::BindingSnapshot],
     truncated: bool,
 ) {
     egui::CollapsingHeader::new(title)
@@ -1621,20 +1621,20 @@ fn marker_text_format(ui: &egui::Ui, markers: MarkerMask) -> egui::TextFormat {
     format
 }
 
-fn phase_label(phase: rlox::DiagnosticPhase) -> &'static str {
+fn phase_label(phase: rlox_protocol::DiagnosticPhase) -> &'static str {
     match phase {
-        rlox::DiagnosticPhase::Scanner => "scanner",
-        rlox::DiagnosticPhase::Parser => "parser",
-        rlox::DiagnosticPhase::Compiler => "compiler",
-        rlox::DiagnosticPhase::Runtime => "runtime",
-        rlox::DiagnosticPhase::Worker => "worker",
+        rlox_protocol::DiagnosticPhase::Scanner => "scanner",
+        rlox_protocol::DiagnosticPhase::Parser => "parser",
+        rlox_protocol::DiagnosticPhase::Compiler => "compiler",
+        rlox_protocol::DiagnosticPhase::Runtime => "runtime",
+        rlox_protocol::DiagnosticPhase::Worker => "worker",
     }
 }
 
-fn severity_label(severity: rlox::DiagnosticSeverity) -> &'static str {
+fn severity_label(severity: rlox_protocol::DiagnosticSeverity) -> &'static str {
     match severity {
-        rlox::DiagnosticSeverity::Error => "Error",
-        rlox::DiagnosticSeverity::Warning => "Warning",
+        rlox_protocol::DiagnosticSeverity::Error => "Error",
+        rlox_protocol::DiagnosticSeverity::Warning => "Warning",
     }
 }
 

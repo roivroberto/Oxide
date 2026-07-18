@@ -1,7 +1,7 @@
 pub use oxide_ide::{
     DocumentId, DocumentStamp, EditRevision, MAX_SOURCE_LINES, RunBinding, RunId, WorkerSessionId,
 };
-use rlox::{RevisionId, SourceDocument, SourceId, SourceSpan, TextPosition};
+use rlox_protocol::{RevisionId, SourceId, SourceSpan, TextPosition};
 
 #[allow(dead_code)]
 #[path = "../src/editor.rs"]
@@ -384,32 +384,16 @@ fn layout_job_preserves_text_and_uses_only_valid_utf8_section_boundaries() {
 }
 
 #[test]
-fn mapper_indexes_the_model_normalized_bom_and_crlf_buffer() {
+fn mapper_indexes_a_normalized_multibyte_buffer() {
     let source_key = key(13, 13, 90, 100);
-    let normalized = SourceDocument::new(
-        source_key.run.source_id,
-        source_key.run.source_revision,
-        "normalized.ox",
-        "\u{feff}a\r\n🦀\rb",
-    );
-    assert_eq!(normalized.text.as_ref(), "a\n🦀\nb");
-    let mapper = SourceMapper::new(source_key, normalized.text.as_ref());
+    let normalized = "a\n🦀\nb";
+    let mapper = SourceMapper::new(source_key, normalized);
     assert_eq!(mapper.line_count(), 3);
     assert_eq!(
-        mapper
-            .position_at(normalized.text.len())
-            .unwrap()
-            .char_index
-            .0,
+        mapper.position_at(normalized.len()).unwrap().char_index.0,
         5
     );
-    assert_eq!(
-        mapper
-            .position_at(normalized.text.len())
-            .unwrap()
-            .line_index,
-        2
-    );
+    assert_eq!(mapper.position_at(normalized.len()).unwrap().line_index, 2);
 }
 
 #[test]

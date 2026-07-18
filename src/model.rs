@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rlox::{
+use rlox_protocol::{
     ActivationId, PauseReason, RevisionId, SnapshotReason, SourceId, SourceSpan, TextPosition,
     VmSnapshot,
 };
@@ -1009,7 +1009,7 @@ impl AppModel {
         self.selected_problem
     }
 
-    pub fn selected_frame(&self) -> Option<&rlox::FrameSnapshot> {
+    pub fn selected_frame(&self) -> Option<&rlox_protocol::FrameSnapshot> {
         let activation = self.selected_activation?;
         self.retained_snapshot
             .as_ref()?

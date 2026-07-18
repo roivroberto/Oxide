@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 
-use rlox::{ActivationId, BindingId, BindingSnapshot, DebugValue, FrameSnapshot, ValueKind};
+use rlox_protocol::{
+    ActivationId, BindingId, BindingSnapshot, DebugValue, FrameSnapshot, ValueKind,
+};
 
 use crate::{SnapshotKey, SnapshotProvenance};
 

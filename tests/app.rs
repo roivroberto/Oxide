@@ -8,7 +8,7 @@ use oxide_ide::{
     SupervisorModelEvent, UiAction, WireDiagnostic, WireRuntimeFrame, WorkerEvent, WorkerSessionId,
     apply_event, frame_accessible_name,
 };
-use rlox::{
+use rlox_protocol::{
     ActivationId, BindingSnapshot, DebugPointId, DebugValue, DiagnosticPhase, DiagnosticSeverity,
     FrameSnapshot, PauseLocation, PauseReason, RevisionId, SnapshotReason, SourceId, SourceSpan,
     TextPosition, ValueKind, VmSnapshot,

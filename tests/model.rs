@@ -9,7 +9,7 @@ use oxide_ide::{
     UnsavedChoice, WireDiagnostic, WireRuntimeFrame, WorkerEvent, WorkerSessionId,
     WorkerTerminationReason, apply_event,
 };
-use rlox::{
+use rlox_protocol::{
     ActivationId, DebugPointId, DiagnosticPhase, DiagnosticSeverity, FrameSnapshot, PauseLocation,
     PauseReason, RevisionId, SnapshotReason, SourceId, SourceSpan, TextPosition, VmSnapshot,
 };

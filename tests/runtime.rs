@@ -8,7 +8,7 @@ use oxide_ide::{
     SupervisorStartError, SupervisorSubmissionId, WorkerEvent, WorkerSessionId, WorkerTarget,
     WorkerTerminationReason,
 };
-use rlox::{RevisionId, SourceId};
+use rlox_protocol::{RevisionId, SourceId};
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};

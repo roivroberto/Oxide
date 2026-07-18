@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use eframe::egui::text::{ByteIndex, CCursor, CCursorRange, CharIndex, LayoutJob};
 use eframe::egui::{TextBuffer, TextFormat};
-use rlox::{SourceId, SourceSpan, TextPosition};
+use rlox_protocol::{SourceId, SourceSpan, TextPosition};
 
 use crate::{DocumentStamp, MAX_SOURCE_LINES, RunBinding};
 
@@ -205,8 +205,8 @@ pub enum SpanMapError {
         actual: SourceId,
     },
     WrongRevision {
-        expected: rlox::RevisionId,
-        actual: rlox::RevisionId,
+        expected: rlox_protocol::RevisionId,
+        actual: rlox_protocol::RevisionId,
     },
     Reversed,
     OutOfBounds {

@@ -2,31 +2,16 @@
 
 use std::process::ExitCode;
 
-use oxide_ide::{APP_NAME, LaunchMode, route_arguments, run_visible, run_worker};
+use oxide_ide::{APP_NAME, run_visible};
 
 const MAX_STARTUP_DETAIL_CHARS: usize = 2_048;
 
 fn main() -> ExitCode {
-    let mode = match route_arguments(std::env::args_os().skip(1)) {
-        Ok(mode) => mode,
-        Err(_) => return ExitCode::from(64),
-    };
-    match mode {
-        LaunchMode::Visible => match run_visible() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                report_visible_startup_error(&error);
-                ExitCode::from(70)
-            }
-        },
-        LaunchMode::Worker(session) => {
-            match run_worker(std::io::stdin(), std::io::stdout(), session) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("Oxide IDE worker failed: {error:?}");
-                    ExitCode::from(70)
-                }
-            }
+    match run_visible() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            report_visible_startup_error(&error);
+            ExitCode::from(70)
         }
     }
 }
