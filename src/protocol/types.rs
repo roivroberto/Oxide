@@ -70,16 +70,20 @@ impl WireDocument {
         if self.revision.0 == 0 {
             return Err(WireDocumentError::ZeroRevision);
         }
-        if self.display_name.is_empty() {
+        Self::validate_content(&self.display_name, &self.text)
+    }
+
+    pub fn validate_content(display_name: &str, text: &str) -> Result<(), WireDocumentError> {
+        if display_name.is_empty() {
             return Err(WireDocumentError::EmptyDisplayName);
         }
-        if self.display_name.len() > MAX_DISPLAY_NAME_BYTES {
+        if display_name.len() > MAX_DISPLAY_NAME_BYTES {
             return Err(WireDocumentError::DisplayNameTooLong);
         }
-        if self.display_name == "."
-            || self.display_name == ".."
-            || self.display_name.trim() != self.display_name
-            || self.display_name.chars().any(|character| {
+        if display_name == "."
+            || display_name == ".."
+            || display_name.trim() != display_name
+            || display_name.chars().any(|character| {
                 character.is_control()
                     || matches!(
                         character,
@@ -89,13 +93,13 @@ impl WireDocument {
         {
             return Err(WireDocumentError::InvalidDisplayName);
         }
-        if self.text.starts_with('\u{feff}') || self.text.contains('\r') {
+        if text.starts_with('\u{feff}') || text.contains('\r') {
             return Err(WireDocumentError::NonNormalizedText);
         }
-        if self.text.len() > MAX_PAYLOAD_BYTES
+        if text.len() > MAX_PAYLOAD_BYTES
             || 256usize
-                .checked_add(conservative_json_string_size(&self.display_name))
-                .and_then(|size| size.checked_add(conservative_json_string_size(&self.text)))
+                .checked_add(conservative_json_string_size(display_name))
+                .and_then(|size| size.checked_add(conservative_json_string_size(text)))
                 .is_none_or(|size| size > MAX_WIRE_DOCUMENT_JSON_BYTES)
         {
             return Err(WireDocumentError::SourceTooLarge);

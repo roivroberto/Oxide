@@ -60,10 +60,35 @@ pub struct SupervisorStartError {
     pub kind: std::io::ErrorKind,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SupervisorSubmissionId(pub u64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisorSource {
+    pub display_name: String,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupervisorRunMode {
+    Run,
+    Debug,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SupervisorRun {
+    pub worker_session_id: WorkerSessionId,
+    pub run_id: RunId,
+    pub source_id: SourceId,
+    pub source_revision: RevisionId,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SupervisorCommand {
-    LoadAndRun(WireDocument),
-    LoadAndDebug(WireDocument),
+    Start {
+        mode: SupervisorRunMode,
+        source: SupervisorSource,
+    },
     Pause,
     Continue,
     StepInto,
@@ -78,8 +103,7 @@ pub enum SupervisorCommand {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SupervisorCommandKind {
-    LoadAndRun,
-    LoadAndDebug,
+    Start,
     Pause,
     Continue,
     StepInto,
@@ -92,8 +116,7 @@ pub enum SupervisorCommandKind {
 impl SupervisorCommand {
     fn kind(&self) -> SupervisorCommandKind {
         match self {
-            Self::LoadAndRun(_) => SupervisorCommandKind::LoadAndRun,
-            Self::LoadAndDebug(_) => SupervisorCommandKind::LoadAndDebug,
+            Self::Start { .. } => SupervisorCommandKind::Start,
             Self::Pause => SupervisorCommandKind::Pause,
             Self::Continue => SupervisorCommandKind::Continue,
             Self::StepInto => SupervisorCommandKind::StepInto,
@@ -106,10 +129,10 @@ impl SupervisorCommand {
 
     fn retained_bytes(&self) -> usize {
         match self {
-            Self::LoadAndRun(document) | Self::LoadAndDebug(document) => document
+            Self::Start { source, .. } => source
                 .text
                 .len()
-                .saturating_add(document.display_name.len())
+                .saturating_add(source.display_name.len())
                 .saturating_add(256),
             Self::ProvideInput { text, .. } => text.len().saturating_add(128),
             _ => 64,
@@ -118,9 +141,14 @@ impl SupervisorCommand {
 
     fn is_valid(&self) -> bool {
         match self {
-            Self::LoadAndRun(document) | Self::LoadAndDebug(document) => {
-                document.validate().is_ok()
+            Self::Start { source, .. } => WireDocument {
+                source_id: SourceId(1),
+                revision: RevisionId(1),
+                display_name: source.display_name.clone(),
+                text: source.text.clone(),
             }
+            .validate()
+            .is_ok(),
             Self::ProvideInput { in_reply_to, text } => {
                 in_reply_to.0 != 0 && text.len() <= MAX_CONTROL_TEXT_BYTES
             }
@@ -131,6 +159,7 @@ impl SupervisorCommand {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubmitError {
+    InvalidSubmissionId,
     NotReady,
     InvalidState,
     Full,
@@ -183,15 +212,37 @@ pub enum ClosureHealth {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SupervisorEvent {
     Worker(Box<Envelope<WorkerEvent>>),
+    Started {
+        submission_id: SupervisorSubmissionId,
+        mode: SupervisorRunMode,
+        run: SupervisorRun,
+        request_id: RequestId,
+        next_event_sequence: EventSequence,
+    },
+    SubmissionAccepted {
+        submission_id: SupervisorSubmissionId,
+        command: SupervisorCommandKind,
+        run: SupervisorRun,
+        request_id: RequestId,
+        next_event_sequence: EventSequence,
+    },
+    CloseAccepted {
+        run: SupervisorRun,
+        request_id: RequestId,
+        next_event_sequence: EventSequence,
+    },
     SubmissionRejected {
+        submission_id: SupervisorSubmissionId,
         command: SupervisorCommandKind,
         error: SubmitError,
     },
     WorkerTerminated {
+        run: Option<SupervisorRun>,
         reason: WorkerTerminationReason,
         stderr: StderrSummary,
     },
     Closed {
+        run: Option<SupervisorRun>,
         status: Option<i32>,
         stderr: StderrSummary,
         health: ClosureHealth,
@@ -220,7 +271,10 @@ impl SupervisorInbox {
         let terminal = match &event {
             SupervisorEvent::Worker(envelope) => envelope.payload.is_terminal(),
             SupervisorEvent::WorkerTerminated { .. } | SupervisorEvent::Closed { .. } => true,
-            SupervisorEvent::SubmissionRejected { .. } => false,
+            SupervisorEvent::Started { .. }
+            | SupervisorEvent::SubmissionAccepted { .. }
+            | SupervisorEvent::CloseAccepted { .. }
+            | SupervisorEvent::SubmissionRejected { .. } => false,
         };
         let mut state = self
             .state
@@ -264,7 +318,10 @@ fn supervisor_event_size(event: &SupervisorEvent) -> usize {
             .worker_event_payload_len(envelope)
             .unwrap_or(INBOX_TOTAL_BYTES)
             .saturating_add(1),
-        SupervisorEvent::SubmissionRejected { .. } => 64,
+        SupervisorEvent::Started { .. }
+        | SupervisorEvent::SubmissionAccepted { .. }
+        | SupervisorEvent::CloseAccepted { .. }
+        | SupervisorEvent::SubmissionRejected { .. } => 128,
         SupervisorEvent::WorkerTerminated { stderr, .. }
         | SupervisorEvent::Closed { stderr, .. } => stderr.retained.len().saturating_add(256),
     }
@@ -309,6 +366,7 @@ impl Drop for SubmissionPermit {
 }
 
 struct QueuedSupervisorCommand {
+    submission_id: SupervisorSubmissionId,
     command: SupervisorCommand,
     _permit: SubmissionPermit,
 }
@@ -319,10 +377,16 @@ pub struct WorkerCommandSender {
     state: Arc<AtomicU8>,
     close_requested: Arc<AtomicBool>,
     submission_budget: Arc<SubmissionBudget>,
+    last_submission_id: Arc<AtomicU64>,
 }
 
 impl WorkerCommandSender {
-    pub fn try_send(&self, command: SupervisorCommand) -> Result<(), SubmitError> {
+    pub fn try_send(
+        &self,
+        submission_id: SupervisorSubmissionId,
+        command: SupervisorCommand,
+    ) -> Result<(), SubmitError> {
+        claim_submission_id(&self.last_submission_id, submission_id)?;
         let state = self.state.load(Ordering::Acquire);
         if state == STATE_CLOSED || state == STATE_CLOSING {
             return Err(SubmitError::Closed);
@@ -345,6 +409,7 @@ impl WorkerCommandSender {
             .try_reserve(command.retained_bytes())?;
         self.actor
             .try_send(ActorMessage::Submit(QueuedSupervisorCommand {
+                submission_id,
                 command,
                 _permit: permit,
             }))
@@ -355,12 +420,33 @@ impl WorkerCommandSender {
     }
 }
 
+fn claim_submission_id(
+    last_submission_id: &AtomicU64,
+    submission_id: SupervisorSubmissionId,
+) -> Result<(), SubmitError> {
+    if submission_id.0 == 0 {
+        return Err(SubmitError::InvalidSubmissionId);
+    }
+    let mut last = last_submission_id.load(Ordering::Acquire);
+    loop {
+        if submission_id.0 <= last {
+            return Err(SubmitError::InvalidSubmissionId);
+        }
+        match last_submission_id.compare_exchange_weak(
+            last,
+            submission_id.0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(actual) => last = actual,
+        }
+    }
+}
+
 fn command_allowed_locally(state: u8, command: &SupervisorCommand) -> bool {
     match state {
-        STATE_BOOTING | STATE_AWAIT_LOAD => matches!(
-            command,
-            SupervisorCommand::LoadAndRun(_) | SupervisorCommand::LoadAndDebug(_)
-        ),
+        STATE_BOOTING | STATE_AWAIT_LOAD => matches!(command, SupervisorCommand::Start { .. }),
         STATE_ACTIVE => matches!(
             command,
             SupervisorCommand::Pause
@@ -434,6 +520,7 @@ impl WorkerSupervisor {
         let state = Arc::new(AtomicU8::new(STATE_BOOTING));
         let close_requested = Arc::new(AtomicBool::new(false));
         let submission_budget = Arc::new(SubmissionBudget::default());
+        let last_submission_id = Arc::new(AtomicU64::new(0));
 
         let writer_actor = actor_tx.clone();
         let writer = thread::spawn(move || writer_thread(stdin, session, writer_rx, writer_actor));
@@ -467,6 +554,7 @@ impl WorkerSupervisor {
                 state,
                 close_requested,
                 submission_budget,
+                last_submission_id,
             },
             inbox,
             session,
@@ -676,9 +764,29 @@ struct ActiveRun {
     driver: RequestId,
 }
 
+impl ActiveRun {
+    fn public(self, worker_session_id: WorkerSessionId) -> SupervisorRun {
+        SupervisorRun {
+            worker_session_id,
+            run_id: self.run_id,
+            source_id: self.source_id,
+            source_revision: self.revision,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommandAdmission {
+    command: SupervisorCommandKind,
+    mode: Option<SupervisorRunMode>,
+    run: SupervisorRun,
+    request_id: RequestId,
+}
+
 struct ActorState {
     phase: ActorPhase,
     event_validator: WorkerEventStreamValidator,
+    next_worker_event_sequence: Option<EventSequence>,
     next_request: Option<u64>,
     next_sequence: Option<u64>,
     issued: HashMap<RequestId, IssuedCommand>,
@@ -709,6 +817,7 @@ impl ActorState {
         Ok(Self {
             phase: ActorPhase::Booting,
             event_validator: WorkerEventStreamValidator::new(session)?,
+            next_worker_event_sequence: Some(EventSequence(1)),
             next_request: Some(1),
             next_sequence: Some(1),
             issued: HashMap::new(),
@@ -809,7 +918,6 @@ fn supervisor_actor(
         }
 
         if state.child_status.is_some() && state.stdout_done && state.stderr.is_some() {
-            finalize_supervisor(&state, &inbox);
             break;
         }
     }
@@ -819,6 +927,7 @@ fn supervisor_actor(
     let _ = stdout_reader.join();
     let _ = stderr_reader.join();
     public_state.store(STATE_CLOSED, Ordering::Release);
+    finalize_supervisor(session, &state, &inbox);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -834,21 +943,31 @@ fn handle_actor_message(
 ) {
     match message {
         ActorMessage::Submit(submission) => {
+            let submission_id = submission.submission_id;
             let command = submission.command.kind();
             if state.close_requested {
-                reject_submission(command, SubmitError::Closed, state, inbox);
+                reject_submission(submission_id, command, SubmitError::Closed, state, inbox);
                 return;
             }
             if state.phase == ActorPhase::Booting {
                 pending.push_back(submission);
             } else {
                 match queue_supervisor_command(submission.command, session, config, state, writer) {
-                    Ok(()) => publish_phase(state.phase, public_state),
+                    Ok(admission) => {
+                        publish_phase(state.phase, public_state);
+                        acknowledge_submission(submission_id, admission, state, inbox);
+                    }
                     Err(QueueCommandError::InvalidState) => {
-                        reject_submission(command, SubmitError::InvalidState, state, inbox);
+                        reject_submission(
+                            submission_id,
+                            command,
+                            SubmitError::InvalidState,
+                            state,
+                            inbox,
+                        );
                     }
                     Err(QueueCommandError::WriterFull) => {
-                        reject_submission(command, SubmitError::Full, state, inbox);
+                        reject_submission(submission_id, command, SubmitError::Full, state, inbox);
                     }
                     Err(QueueCommandError::IdExhausted) => {
                         state.fail(WorkerTerminationReason::RequestExhausted);
@@ -870,17 +989,26 @@ fn handle_actor_message(
                     }
                 }
                 ActorPhase::Active | ActorPhase::Paused => {
-                    if state.pending_stop.is_none()
-                        && queue_supervisor_command(
+                    if state.pending_stop.is_none() {
+                        match queue_supervisor_command(
                             SupervisorCommand::Stop,
                             session,
                             config,
                             state,
                             writer,
-                        )
-                        .is_err()
-                    {
-                        state.fail(WorkerTerminationReason::WriterClosed);
+                        ) {
+                            Ok(admission) => acknowledge_close(admission, state, inbox),
+                            Err(QueueCommandError::IdExhausted) => {
+                                state.fail(WorkerTerminationReason::RequestExhausted);
+                            }
+                            Err(QueueCommandError::InvalidState) => {
+                                state.fail(WorkerTerminationReason::CausalityViolation);
+                            }
+                            Err(QueueCommandError::WriterFull)
+                            | Err(QueueCommandError::WriterClosed) => {
+                                state.fail(WorkerTerminationReason::WriterClosed);
+                            }
+                        }
                     }
                 }
                 ActorPhase::Terminal => {
@@ -906,13 +1034,22 @@ fn handle_actor_message(
                 }
             } else if state.phase == ActorPhase::AwaitLoad {
                 if state.close_requested {
-                    pending.clear();
+                    while let Some(submission) = pending.pop_front() {
+                        reject_submission(
+                            submission.submission_id,
+                            submission.command.kind(),
+                            SubmitError::Closed,
+                            state,
+                            inbox,
+                        );
+                    }
                     if queue_shutdown(session, state, writer, config).is_err() {
                         state.fail(WorkerTerminationReason::WriterClosed);
                     }
                     publish_phase(state.phase, public_state);
                 } else {
                     while let Some(submission) = pending.pop_front() {
+                        let submission_id = submission.submission_id;
                         let command = submission.command.kind();
                         match queue_supervisor_command(
                             submission.command,
@@ -921,12 +1058,27 @@ fn handle_actor_message(
                             state,
                             writer,
                         ) {
-                            Ok(()) => publish_phase(state.phase, public_state),
+                            Ok(admission) => {
+                                publish_phase(state.phase, public_state);
+                                acknowledge_submission(submission_id, admission, state, inbox);
+                            }
                             Err(QueueCommandError::InvalidState) => {
-                                reject_submission(command, SubmitError::InvalidState, state, inbox);
+                                reject_submission(
+                                    submission_id,
+                                    command,
+                                    SubmitError::InvalidState,
+                                    state,
+                                    inbox,
+                                );
                             }
                             Err(QueueCommandError::WriterFull) => {
-                                reject_submission(command, SubmitError::Full, state, inbox);
+                                reject_submission(
+                                    submission_id,
+                                    command,
+                                    SubmitError::Full,
+                                    state,
+                                    inbox,
+                                );
                             }
                             Err(QueueCommandError::IdExhausted) => {
                                 state.fail(WorkerTerminationReason::RequestExhausted);
@@ -977,13 +1129,71 @@ fn handle_actor_message(
 }
 
 fn reject_submission(
+    submission_id: SupervisorSubmissionId,
     command: SupervisorCommandKind,
     error: SubmitError,
     state: &mut ActorState,
     inbox: &SupervisorInbox,
 ) {
     if inbox
-        .push(SupervisorEvent::SubmissionRejected { command, error })
+        .push(SupervisorEvent::SubmissionRejected {
+            submission_id,
+            command,
+            error,
+        })
+        .is_err()
+    {
+        state.fail(WorkerTerminationReason::EventInboxExceeded);
+    }
+}
+
+fn acknowledge_submission(
+    submission_id: SupervisorSubmissionId,
+    admission: CommandAdmission,
+    state: &mut ActorState,
+    inbox: &SupervisorInbox,
+) {
+    let Some(next_event_sequence) = state.next_worker_event_sequence else {
+        state.fail(WorkerTerminationReason::CausalityViolation);
+        return;
+    };
+    let event = if let Some(mode) = admission.mode {
+        SupervisorEvent::Started {
+            submission_id,
+            mode,
+            run: admission.run,
+            request_id: admission.request_id,
+            next_event_sequence,
+        }
+    } else {
+        SupervisorEvent::SubmissionAccepted {
+            submission_id,
+            command: admission.command,
+            run: admission.run,
+            request_id: admission.request_id,
+            next_event_sequence,
+        }
+    };
+    if inbox.push(event).is_err() {
+        state.fail(WorkerTerminationReason::EventInboxExceeded);
+    }
+}
+
+fn acknowledge_close(admission: CommandAdmission, state: &mut ActorState, inbox: &SupervisorInbox) {
+    let Some(next_event_sequence) = state.next_worker_event_sequence else {
+        state.fail(WorkerTerminationReason::CausalityViolation);
+        return;
+    };
+    if admission.command != SupervisorCommandKind::Stop || admission.mode.is_some() {
+        state.fail(WorkerTerminationReason::CausalityViolation);
+        return;
+    }
+    if inbox
+        .push(SupervisorEvent::CloseAccepted {
+            run: admission.run,
+            request_id: admission.request_id,
+            next_event_sequence,
+        })
         .is_err()
     {
         state.fail(WorkerTerminationReason::EventInboxExceeded);
@@ -996,11 +1206,10 @@ fn queue_supervisor_command(
     config: &SupervisorConfig,
     state: &mut ActorState,
     writer: &mpsc::SyncSender<WriteRequest>,
-) -> Result<(), QueueCommandError> {
+) -> Result<CommandAdmission, QueueCommandError> {
+    let public_command = command.kind();
     let legal = match &command {
-        SupervisorCommand::LoadAndRun(_) | SupervisorCommand::LoadAndDebug(_) => {
-            state.phase == ActorPhase::AwaitLoad
-        }
+        SupervisorCommand::Start { .. } => state.phase == ActorPhase::AwaitLoad,
         SupervisorCommand::Pause => {
             state.phase == ActorPhase::Active
                 && state.pending_pause.is_none()
@@ -1023,25 +1232,29 @@ fn queue_supervisor_command(
     if !legal {
         return Err(QueueCommandError::InvalidState);
     }
-    let (payload, kind, run_id, revision, source_id) = match command {
-        SupervisorCommand::LoadAndRun(document) => (
-            Command::LoadAndRun {
-                document: document.clone(),
-            },
-            IssuedKind::LoadRun,
-            RunId(1),
-            document.revision,
-            Some(document.source_id),
-        ),
-        SupervisorCommand::LoadAndDebug(document) => (
-            Command::LoadAndDebug {
-                document: document.clone(),
-            },
-            IssuedKind::LoadDebug,
-            RunId(1),
-            document.revision,
-            Some(document.source_id),
-        ),
+    let (payload, kind, run_id, revision, source_id, mode) = match command {
+        SupervisorCommand::Start { mode, source } => {
+            let document = WireDocument {
+                source_id: SourceId(session.0),
+                revision: RevisionId(1),
+                display_name: source.display_name,
+                text: source.text,
+            };
+            let (payload, kind) = match mode {
+                SupervisorRunMode::Run => (Command::LoadAndRun { document }, IssuedKind::LoadRun),
+                SupervisorRunMode::Debug => {
+                    (Command::LoadAndDebug { document }, IssuedKind::LoadDebug)
+                }
+            };
+            (
+                payload,
+                kind,
+                RunId(1),
+                RevisionId(1),
+                Some(SourceId(session.0)),
+                Some(mode),
+            )
+        }
         SupervisorCommand::Pause => current_command(state, Command::Pause, IssuedKind::Pause)?,
         SupervisorCommand::Continue => {
             current_command(state, Command::Continue, IssuedKind::Continue)?
@@ -1109,16 +1322,34 @@ fn queue_supervisor_command(
         }
         IssuedKind::ProvideInput | IssuedKind::Shutdown => {}
     }
-    Ok(())
+    let run = state
+        .active
+        .ok_or(QueueCommandError::InvalidState)?
+        .public(session);
+    Ok(CommandAdmission {
+        command: public_command,
+        mode,
+        run,
+        request_id: prepared.request,
+    })
 }
+
+type CurrentCommand = (
+    Command,
+    IssuedKind,
+    RunId,
+    RevisionId,
+    Option<SourceId>,
+    Option<SupervisorRunMode>,
+);
 
 fn current_command(
     state: &ActorState,
     payload: Command,
     kind: IssuedKind,
-) -> Result<(Command, IssuedKind, RunId, RevisionId, Option<SourceId>), QueueCommandError> {
+) -> Result<CurrentCommand, QueueCommandError> {
     let active = state.active.ok_or(QueueCommandError::InvalidState)?;
-    Ok((payload, kind, active.run_id, active.revision, None))
+    Ok((payload, kind, active.run_id, active.revision, None, None))
 }
 
 fn prepare_command(
@@ -1218,9 +1449,16 @@ fn accept_worker_event(
         if state.phase != ActorPhase::Booting {
             return Err(WorkerTerminationReason::CausalityViolation);
         }
+        let next_event_sequence = envelope
+            .sequence
+            .0
+            .checked_add(1)
+            .map(EventSequence)
+            .ok_or(WorkerTerminationReason::CausalityViolation)?;
         inbox
             .push(SupervisorEvent::Worker(Box::new(envelope)))
             .map_err(|_| WorkerTerminationReason::EventInboxExceeded)?;
+        state.next_worker_event_sequence = Some(next_event_sequence);
         state.phase = ActorPhase::AwaitLoad;
         public_state.store(STATE_AWAIT_LOAD, Ordering::Release);
         return Ok(());
@@ -1246,9 +1484,22 @@ fn accept_worker_event(
     publish_phase(state.phase, public_state);
 
     let terminal = envelope.payload.is_terminal();
+    let next_event_sequence = if terminal {
+        None
+    } else {
+        Some(
+            envelope
+                .sequence
+                .0
+                .checked_add(1)
+                .map(EventSequence)
+                .ok_or(WorkerTerminationReason::CausalityViolation)?,
+        )
+    };
     inbox
         .push(SupervisorEvent::Worker(Box::new(envelope)))
         .map_err(|_| WorkerTerminationReason::EventInboxExceeded)?;
+    state.next_worker_event_sequence = next_event_sequence;
     if terminal {
         state.terminal_seen = true;
         state.phase = ActorPhase::Terminal;
@@ -1425,8 +1676,9 @@ fn ensure_killed_and_reaped(child: &mut Child, state: &mut ActorState) {
     }
 }
 
-fn finalize_supervisor(state: &ActorState, inbox: &SupervisorInbox) {
+fn finalize_supervisor(session: WorkerSessionId, state: &ActorState, inbox: &SupervisorInbox) {
     let stderr = state.stderr.clone().unwrap_or_default();
+    let run = state.active.map(|active| active.public(session));
     let event = if state.terminal_seen || state.close_requested && state.active.is_none() {
         let status = state.child_status.flatten();
         let health = if state.closure_health != ClosureHealth::Clean {
@@ -1437,12 +1689,14 @@ fn finalize_supervisor(state: &ActorState, inbox: &SupervisorInbox) {
             ClosureHealth::NonzeroExit
         };
         SupervisorEvent::Closed {
+            run,
             status,
             stderr,
             health,
         }
     } else {
         SupervisorEvent::WorkerTerminated {
+            run,
             reason: state
                 .failure
                 .unwrap_or(WorkerTerminationReason::UnexpectedExit(
@@ -1549,11 +1803,41 @@ mod tests {
         state.stderr = Some(StderrSummary::default());
         state.failure = Some(WorkerTerminationReason::UnexpectedExit(Some(9)));
         let inbox = SupervisorInbox::default();
-        finalize_supervisor(&state, &inbox);
+        finalize_supervisor(WorkerSessionId(1), &state, &inbox);
         assert!(matches!(
             inbox.pop().unwrap(),
             Some(SupervisorEvent::Closed {
+                run: Some(SupervisorRun {
+                    worker_session_id: WorkerSessionId(1),
+                    run_id: RunId(1),
+                    source_id: SourceId(1),
+                    source_revision: RevisionId(1),
+                }),
                 health: ClosureHealth::NonzeroExit,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn preterminal_worker_termination_retains_the_active_run() {
+        let mut state = active_state();
+        state.child_status = Some(Some(9));
+        state.stdout_done = true;
+        state.stderr = Some(StderrSummary::default());
+        state.failure = Some(WorkerTerminationReason::UnexpectedExit(Some(9)));
+        let inbox = SupervisorInbox::default();
+        finalize_supervisor(WorkerSessionId(1), &state, &inbox);
+        assert!(matches!(
+            inbox.pop().unwrap(),
+            Some(SupervisorEvent::WorkerTerminated {
+                run: Some(SupervisorRun {
+                    worker_session_id: WorkerSessionId(1),
+                    run_id: RunId(1),
+                    source_id: SourceId(1),
+                    source_revision: RevisionId(1),
+                }),
+                reason: WorkerTerminationReason::UnexpectedExit(Some(9)),
                 ..
             })
         ));
@@ -1570,20 +1854,27 @@ mod tests {
             state,
             close_requested,
             submission_budget: submission_budget.clone(),
+            last_submission_id: Arc::new(AtomicU64::new(0)),
         };
         let text = "a".repeat(MAX_PAYLOAD_BYTES - 128 * 1024);
-        let command = || {
-            SupervisorCommand::LoadAndRun(WireDocument {
-                source_id: SourceId(1),
-                revision: RevisionId(1),
+        let command = || SupervisorCommand::Start {
+            mode: SupervisorRunMode::Run,
+            source: SupervisorSource {
                 display_name: "bounded.lox".to_string(),
                 text: text.clone(),
-            })
+            },
         };
 
-        sender.try_send(command()).expect("first large submission");
-        sender.try_send(command()).expect("second large submission");
-        assert_eq!(sender.try_send(command()), Err(SubmitError::Full));
+        sender
+            .try_send(SupervisorSubmissionId(1), command())
+            .expect("first large submission");
+        sender
+            .try_send(SupervisorSubmissionId(2), command())
+            .expect("second large submission");
+        assert_eq!(
+            sender.try_send(SupervisorSubmissionId(3), command()),
+            Err(SubmitError::Full)
+        );
 
         drop(receiver);
         assert_eq!(*submission_budget.bytes.lock().unwrap(), 0);
@@ -1598,15 +1889,20 @@ mod tests {
             state: Arc::new(AtomicU8::new(STATE_BOOTING)),
             close_requested: Arc::new(AtomicBool::new(false)),
             submission_budget: submission_budget.clone(),
+            last_submission_id: Arc::new(AtomicU64::new(0)),
         };
 
         assert_eq!(
-            sender.try_send(SupervisorCommand::LoadAndRun(WireDocument {
-                source_id: SourceId(0),
-                revision: RevisionId(1),
-                display_name: "invalid.lox".to_string(),
-                text: "print 1;\n".to_string(),
-            })),
+            sender.try_send(
+                SupervisorSubmissionId(1),
+                SupervisorCommand::Start {
+                    mode: SupervisorRunMode::Run,
+                    source: SupervisorSource {
+                        display_name: "folder/invalid.lox".to_string(),
+                        text: "print 1;\n".to_string(),
+                    },
+                },
+            ),
             Err(SubmitError::InvalidCommand)
         );
         assert!(matches!(
@@ -1627,6 +1923,7 @@ mod tests {
                 state: Arc::new(AtomicU8::new(STATE_BOOTING)),
                 close_requested: close_requested.clone(),
                 submission_budget: Arc::new(SubmissionBudget::default()),
+                last_submission_id: Arc::new(AtomicU64::new(0)),
             },
             inbox: Arc::new(SupervisorInbox::default()),
             session: WorkerSessionId(1),
@@ -1648,12 +1945,14 @@ mod tests {
         let public_state = AtomicU8::new(STATE_BOOTING);
         let budget = Arc::new(SubmissionBudget::default());
         let mut pending = VecDeque::from([QueuedSupervisorCommand {
-            command: SupervisorCommand::LoadAndRun(WireDocument {
-                source_id: SourceId(7),
-                revision: RevisionId(9),
-                display_name: "discarded.lox".to_string(),
-                text: "print 1;\n".to_string(),
-            }),
+            submission_id: SupervisorSubmissionId(1),
+            command: SupervisorCommand::Start {
+                mode: SupervisorRunMode::Run,
+                source: SupervisorSource {
+                    display_name: "discarded.lox".to_string(),
+                    text: "print 1;\n".to_string(),
+                },
+            },
             _permit: budget.try_reserve(64).unwrap(),
         }]);
 
@@ -1699,5 +1998,13 @@ mod tests {
             inbox.pop().unwrap(),
             Some(SupervisorEvent::Worker(envelope)) if envelope.payload == WorkerEvent::Hello
         ));
+        assert_eq!(
+            inbox.pop().unwrap(),
+            Some(SupervisorEvent::SubmissionRejected {
+                submission_id: SupervisorSubmissionId(1),
+                command: SupervisorCommandKind::Start,
+                error: SubmitError::Closed,
+            })
+        );
     }
 }
