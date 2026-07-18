@@ -223,6 +223,13 @@ pub enum SpanMapError {
         expected: TextPosition,
         actual: TextPosition,
     },
+    RunContextRequired,
+    ReversedCharacters,
+    CharacterRangeMismatch {
+        endpoint: SpanEndpoint,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,6 +268,39 @@ impl MappedSpan {
             h_pos: None,
         }
     }
+
+    fn document_range(self, document: DocumentStamp) -> DocumentRange {
+        DocumentRange::new(
+            document,
+            self.start.byte_index.0..self.end.byte_index.0,
+            self.start.char_index..self.end.char_index,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentRange {
+    pub document: DocumentStamp,
+    pub byte_range: Range<usize>,
+    pub char_range: Range<CharIndex>,
+}
+
+impl DocumentRange {
+    pub const fn new(
+        document: DocumentStamp,
+        byte_range: Range<usize>,
+        char_range: Range<CharIndex>,
+    ) -> Self {
+        Self {
+            document,
+            byte_range,
+            char_range,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.byte_range.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,7 +318,8 @@ struct MultibyteScalar {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceMapper {
-    key: EditorSourceKey,
+    document: DocumentStamp,
+    run: Option<RunBinding>,
     text_bytes: usize,
     total_chars: usize,
     line_starts: Vec<LineStart>,
@@ -287,6 +328,14 @@ pub struct SourceMapper {
 
 impl SourceMapper {
     pub fn new(key: EditorSourceKey, source: &str) -> Self {
+        Self::with_source(key.document, Some(key.run), source)
+    }
+
+    pub fn for_document(document: DocumentStamp, source: &str) -> Self {
+        Self::with_source(document, None, source)
+    }
+
+    fn with_source(document: DocumentStamp, run: Option<RunBinding>, source: &str) -> Self {
         let mut line_starts = vec![LineStart {
             byte_offset: 0,
             char_index: 0,
@@ -316,7 +365,8 @@ impl SourceMapper {
         }
 
         Self {
-            key,
+            document,
+            run,
             text_bytes: source.len(),
             total_chars: char_index,
             line_starts,
@@ -324,8 +374,12 @@ impl SourceMapper {
         }
     }
 
-    pub fn key(&self) -> EditorSourceKey {
-        self.key
+    pub fn document(&self) -> DocumentStamp {
+        self.document
+    }
+
+    pub fn run_key(&self) -> Option<EditorSourceKey> {
+        self.run.map(|run| EditorSourceKey::new(self.document, run))
     }
 
     pub fn line_count(&self) -> usize {
@@ -379,27 +433,52 @@ impl SourceMapper {
     }
 
     pub fn map_span(&self, marker: MarkerSpan) -> Result<MappedSpan, SpanMapError> {
-        if marker.source.document != self.key.document {
+        let Some(run) = self.run else {
+            return Err(SpanMapError::RunContextRequired);
+        };
+        self.map_run_span(EditorSourceKey::new(self.document, run), marker)
+    }
+
+    pub fn map_run_span(
+        &self,
+        expected: EditorSourceKey,
+        marker: MarkerSpan,
+    ) -> Result<MappedSpan, SpanMapError> {
+        if expected.document != self.document {
             return Err(SpanMapError::StaleDocument {
-                expected: self.key.document,
+                expected: self.document,
+                actual: expected.document,
+            });
+        }
+        if let Some(run) = self.run
+            && expected.run != run
+        {
+            return Err(SpanMapError::StaleRun {
+                expected: run,
+                actual: expected.run,
+            });
+        }
+        if marker.source.document != expected.document {
+            return Err(SpanMapError::StaleDocument {
+                expected: expected.document,
                 actual: marker.source.document,
             });
         }
-        if marker.source.run != self.key.run {
+        if marker.source.run != expected.run {
             return Err(SpanMapError::StaleRun {
-                expected: self.key.run,
+                expected: expected.run,
                 actual: marker.source.run,
             });
         }
-        if marker.span.source_id != self.key.run.source_id {
+        if marker.span.source_id != expected.run.source_id {
             return Err(SpanMapError::WrongSource {
-                expected: self.key.run.source_id,
+                expected: expected.run.source_id,
                 actual: marker.span.source_id,
             });
         }
-        if marker.span.revision != self.key.run.source_revision {
+        if marker.span.revision != expected.run.source_revision {
             return Err(SpanMapError::WrongRevision {
-                expected: self.key.run.source_revision,
+                expected: expected.run.source_revision,
                 actual: marker.span.revision,
             });
         }
@@ -410,6 +489,70 @@ impl SourceMapper {
         let start = self.map_endpoint(SpanEndpoint::Start, marker.span.start)?;
         let end = self.map_endpoint(SpanEndpoint::End, marker.span.end)?;
         Ok(MappedSpan { start, end })
+    }
+
+    pub fn map_run_range(
+        &self,
+        expected: EditorSourceKey,
+        marker: MarkerSpan,
+    ) -> Result<DocumentRange, SpanMapError> {
+        self.map_run_span(expected, marker)
+            .map(|span| span.document_range(self.document))
+    }
+
+    pub fn map_document_range(&self, range: &DocumentRange) -> Result<MappedSpan, SpanMapError> {
+        if range.document != self.document {
+            return Err(SpanMapError::StaleDocument {
+                expected: self.document,
+                actual: range.document,
+            });
+        }
+        if range.byte_range.start > range.byte_range.end {
+            return Err(SpanMapError::Reversed);
+        }
+        if range.char_range.start > range.char_range.end {
+            return Err(SpanMapError::ReversedCharacters);
+        }
+        let start = self.map_document_endpoint(
+            SpanEndpoint::Start,
+            range.byte_range.start,
+            range.char_range.start,
+        )?;
+        let end = self.map_document_endpoint(
+            SpanEndpoint::End,
+            range.byte_range.end,
+            range.char_range.end,
+        )?;
+        Ok(MappedSpan { start, end })
+    }
+
+    fn map_document_endpoint(
+        &self,
+        endpoint: SpanEndpoint,
+        byte_offset: usize,
+        supplied_character: CharIndex,
+    ) -> Result<MappedPosition, SpanMapError> {
+        if byte_offset > self.text_bytes {
+            return Err(SpanMapError::OutOfBounds {
+                endpoint,
+                byte_offset,
+                text_bytes: self.text_bytes,
+            });
+        }
+        let Some(mapped) = self.position_at(byte_offset) else {
+            return Err(SpanMapError::NotCharBoundary {
+                endpoint,
+                byte_offset,
+            });
+        };
+        if mapped.char_index != supplied_character {
+            return Err(SpanMapError::CharacterRangeMismatch {
+                endpoint,
+                expected: mapped.char_index.0,
+                actual: supplied_character.0,
+            });
+        }
+        Ok(mapped)
     }
 
     fn map_endpoint(
@@ -458,6 +601,34 @@ impl SourceMapper {
             }
         }
 
+        self.build_marker_plan(valid, rejected)
+    }
+
+    pub fn resolve_document_markers(&self, markers: DocumentMarkerInputs) -> MarkerPlan {
+        let mut valid = Vec::with_capacity(3);
+        let mut rejected = Vec::with_capacity(3);
+        for (kind, range) in [
+            (MarkerKind::Current, markers.current),
+            (MarkerKind::Fault, markers.fault),
+            (MarkerKind::Navigation, markers.navigation),
+        ] {
+            let Some(range) = range else {
+                continue;
+            };
+            match self.map_document_range(&range) {
+                Ok(span) => valid.push(ResolvedMarker { kind, span }),
+                Err(error) => rejected.push(RejectedMarker { kind, error }),
+            }
+        }
+
+        self.build_marker_plan(valid, rejected)
+    }
+
+    fn build_marker_plan(
+        &self,
+        valid: Vec<ResolvedMarker>,
+        rejected: Vec<RejectedMarker>,
+    ) -> MarkerPlan {
         let mut endpoints = Vec::with_capacity(2 + valid.len() * 2);
         endpoints.push(
             self.position_at(0)
@@ -527,7 +698,7 @@ impl SourceMapper {
         }
 
         MarkerPlan {
-            source: self.key,
+            document: self.document,
             text_bytes: self.text_bytes,
             format_runs,
             point_markers: points.into_values().collect(),
@@ -560,6 +731,13 @@ pub struct MarkerInputs {
     pub current: Option<MarkerSpan>,
     pub fault: Option<MarkerSpan>,
     pub navigation: Option<MarkerSpan>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DocumentMarkerInputs {
+    pub current: Option<DocumentRange>,
+    pub fault: Option<DocumentRange>,
+    pub navigation: Option<DocumentRange>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -641,7 +819,7 @@ pub struct RejectedMarker {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkerPlan {
-    source: EditorSourceKey,
+    document: DocumentStamp,
     text_bytes: usize,
     format_runs: Vec<FormatRun>,
     point_markers: Vec<PointMarker>,
@@ -650,8 +828,8 @@ pub struct MarkerPlan {
 }
 
 impl MarkerPlan {
-    pub fn source(&self) -> EditorSourceKey {
-        self.source
+    pub fn document(&self) -> DocumentStamp {
+        self.document
     }
 
     pub fn format_runs(&self) -> &[FormatRun] {
@@ -669,6 +847,318 @@ impl MarkerPlan {
     pub fn rejected(&self) -> &[RejectedMarker] {
         &self.rejected
     }
+}
+
+pub const MAX_PREPARED_SYNTAX_RUNS: usize = 4_096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntaxClass {
+    Keyword,
+    Comment,
+    String,
+    Number,
+    Variable,
+    Operator,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedSyntaxRun {
+    pub range: DocumentRange,
+    pub class: SyntaxClass,
+}
+
+impl PreparedSyntaxRun {
+    pub const fn new(range: DocumentRange, class: SyntaxClass) -> Self {
+        Self { range, class }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntaxPlanRejection {
+    MarkerPlanMismatch,
+    TooManyRuns { actual: usize, maximum: usize },
+    EmptyRun { index: usize },
+    InvalidRun { index: usize, error: SpanMapError },
+    UnsortedOrOverlapping { index: usize },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedLayoutRun {
+    pub byte_range: Range<usize>,
+    pub char_range: Range<CharIndex>,
+    pub syntax: Option<SyntaxClass>,
+    pub markers: MarkerMask,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedLayoutPlan {
+    document: DocumentStamp,
+    text_bytes: usize,
+    runs: Vec<PreparedLayoutRun>,
+    point_markers: Vec<PointMarker>,
+    gutter_markers: Vec<GutterMarker>,
+    rejected_markers: Vec<RejectedMarker>,
+    syntax_rejection: Option<SyntaxPlanRejection>,
+    merge_operations: usize,
+}
+
+impl PreparedLayoutPlan {
+    pub fn compose(
+        mapper: &SourceMapper,
+        markers: &MarkerPlan,
+        syntax: &[PreparedSyntaxRun],
+    ) -> Self {
+        if !marker_plan_matches(mapper, markers) {
+            let empty = mapper.build_marker_plan(Vec::new(), Vec::new());
+            return Self::marker_only(&empty, Some(SyntaxPlanRejection::MarkerPlanMismatch));
+        }
+        if syntax.len() > MAX_PREPARED_SYNTAX_RUNS {
+            return Self::marker_only(
+                markers,
+                Some(SyntaxPlanRejection::TooManyRuns {
+                    actual: syntax.len(),
+                    maximum: MAX_PREPARED_SYNTAX_RUNS,
+                }),
+            );
+        }
+
+        let mut previous_end = None;
+        for (index, run) in syntax.iter().enumerate() {
+            let mapped = match mapper.map_document_range(&run.range) {
+                Ok(mapped) => mapped,
+                Err(error) => {
+                    return Self::marker_only(
+                        markers,
+                        Some(SyntaxPlanRejection::InvalidRun { index, error }),
+                    );
+                }
+            };
+            if mapped.is_empty() {
+                return Self::marker_only(markers, Some(SyntaxPlanRejection::EmptyRun { index }));
+            }
+            if previous_end.is_some_and(|end| end > mapped.start.byte_index.0) {
+                return Self::marker_only(
+                    markers,
+                    Some(SyntaxPlanRejection::UnsortedOrOverlapping { index }),
+                );
+            }
+            previous_end = Some(mapped.end.byte_index.0);
+        }
+
+        Self::merge(markers, syntax)
+    }
+
+    fn marker_only(markers: &MarkerPlan, rejection: Option<SyntaxPlanRejection>) -> Self {
+        Self {
+            document: markers.document,
+            text_bytes: markers.text_bytes,
+            runs: markers
+                .format_runs
+                .iter()
+                .map(|run| PreparedLayoutRun {
+                    byte_range: run.byte_range.clone(),
+                    char_range: run.char_range.clone(),
+                    syntax: None,
+                    markers: run.markers,
+                })
+                .collect(),
+            point_markers: markers.point_markers.clone(),
+            gutter_markers: markers.gutter_markers.clone(),
+            rejected_markers: markers.rejected.clone(),
+            syntax_rejection: rejection,
+            merge_operations: markers.format_runs.len(),
+        }
+    }
+
+    fn merge(markers: &MarkerPlan, syntax: &[PreparedSyntaxRun]) -> Self {
+        let mut runs: Vec<PreparedLayoutRun> =
+            Vec::with_capacity(markers.format_runs.len().saturating_add(syntax.len() * 2));
+        let mut marker_index = 0usize;
+        let mut syntax_index = 0usize;
+        let mut byte = 0usize;
+        let mut character = CharIndex(0);
+        let mut merge_operations = 0usize;
+
+        while let Some(marker) = markers.format_runs.get(marker_index) {
+            if byte == marker.byte_range.end {
+                marker_index += 1;
+                merge_operations = merge_operations.saturating_add(1);
+                continue;
+            }
+            while syntax
+                .get(syntax_index)
+                .is_some_and(|run| run.range.byte_range.end <= byte)
+            {
+                syntax_index += 1;
+                merge_operations = merge_operations.saturating_add(1);
+            }
+
+            let mut syntax_class = None;
+            let mut end_byte = marker.byte_range.end;
+            let mut end_character = marker.char_range.end;
+            if let Some(syntax_run) = syntax.get(syntax_index) {
+                if byte < syntax_run.range.byte_range.start {
+                    if syntax_run.range.byte_range.start < end_byte {
+                        end_byte = syntax_run.range.byte_range.start;
+                        end_character = syntax_run.range.char_range.start;
+                    }
+                } else if byte < syntax_run.range.byte_range.end {
+                    syntax_class = Some(syntax_run.class);
+                    if syntax_run.range.byte_range.end < end_byte {
+                        end_byte = syntax_run.range.byte_range.end;
+                        end_character = syntax_run.range.char_range.end;
+                    }
+                }
+            }
+
+            debug_assert!(byte < end_byte, "validated merge must make progress");
+            merge_operations = merge_operations.saturating_add(1);
+            push_prepared_run(
+                &mut runs,
+                PreparedLayoutRun {
+                    byte_range: byte..end_byte,
+                    char_range: character..end_character,
+                    syntax: syntax_class,
+                    markers: marker.markers,
+                },
+            );
+            byte = end_byte;
+            character = end_character;
+        }
+
+        Self {
+            document: markers.document,
+            text_bytes: markers.text_bytes,
+            runs,
+            point_markers: markers.point_markers.clone(),
+            gutter_markers: markers.gutter_markers.clone(),
+            rejected_markers: markers.rejected.clone(),
+            syntax_rejection: None,
+            merge_operations,
+        }
+    }
+
+    pub fn document(&self) -> DocumentStamp {
+        self.document
+    }
+
+    pub fn runs(&self) -> &[PreparedLayoutRun] {
+        &self.runs
+    }
+
+    pub fn point_markers(&self) -> &[PointMarker] {
+        &self.point_markers
+    }
+
+    pub fn gutter_markers(&self) -> &[GutterMarker] {
+        &self.gutter_markers
+    }
+
+    pub fn rejected_markers(&self) -> &[RejectedMarker] {
+        &self.rejected_markers
+    }
+
+    pub fn syntax_rejection(&self) -> Option<SyntaxPlanRejection> {
+        self.syntax_rejection
+    }
+
+    pub fn merge_operations(&self) -> usize {
+        self.merge_operations
+    }
+}
+
+fn push_prepared_run(runs: &mut Vec<PreparedLayoutRun>, run: PreparedLayoutRun) {
+    if let Some(previous) = runs.last_mut()
+        && previous.syntax == run.syntax
+        && previous.markers == run.markers
+        && previous.byte_range.end == run.byte_range.start
+        && previous.char_range.end == run.char_range.start
+    {
+        previous.byte_range.end = run.byte_range.end;
+        previous.char_range.end = run.char_range.end;
+    } else {
+        runs.push(run);
+    }
+}
+
+fn marker_plan_matches(mapper: &SourceMapper, plan: &MarkerPlan) -> bool {
+    if plan.document != mapper.document || plan.text_bytes != mapper.text_bytes {
+        return false;
+    }
+    if mapper.text_bytes == 0 {
+        return plan.format_runs.is_empty();
+    }
+    let mut next_byte = 0usize;
+    let mut next_character = CharIndex(0);
+    let valid = plan.format_runs.iter().all(|run| {
+        let contiguous = run.byte_range.start == next_byte
+            && run.char_range.start == next_character
+            && run.byte_range.start < run.byte_range.end
+            && run.char_range.start < run.char_range.end
+            && run.byte_range.end <= mapper.text_bytes
+            && mapper
+                .position_at(run.byte_range.start)
+                .is_some_and(|position| position.char_index == run.char_range.start)
+            && mapper
+                .position_at(run.byte_range.end)
+                .is_some_and(|position| position.char_index == run.char_range.end);
+        next_byte = run.byte_range.end;
+        next_character = run.char_range.end;
+        contiguous
+    });
+    valid && next_byte == mapper.text_bytes && next_character.0 == mapper.total_chars
+}
+
+pub fn build_prepared_layout_job(
+    document: DocumentStamp,
+    source: &str,
+    plan: &PreparedLayoutPlan,
+    mut format_for: impl FnMut(Option<SyntaxClass>, MarkerMask) -> TextFormat,
+) -> LayoutJob {
+    let valid_plan = plan.document == document
+        && plan.text_bytes == source.len()
+        && if source.is_empty() {
+            plan.runs.is_empty()
+        } else {
+            let mut next_byte = 0usize;
+            let mut next_character = CharIndex(0);
+            let valid = plan.runs.iter().all(|run| {
+                let contiguous = run.byte_range.start == next_byte
+                    && run.char_range.start == next_character
+                    && run.byte_range.start < run.byte_range.end
+                    && run.char_range.start < run.char_range.end
+                    && run.byte_range.end <= source.len()
+                    && source.is_char_boundary(run.byte_range.start)
+                    && source.is_char_boundary(run.byte_range.end)
+                    && run.char_range.end.0.checked_sub(run.char_range.start.0)
+                        == Some(source[run.byte_range.clone()].chars().count());
+                next_byte = run.byte_range.end;
+                next_character = run.char_range.end;
+                contiguous
+            });
+            valid && next_byte == source.len() && next_character.0 == source.chars().count()
+        };
+
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    job.break_on_newline = true;
+    job.keep_trailing_whitespace = true;
+    if !valid_plan {
+        job.append(source, 0.0, format_for(None, MarkerMask::NONE));
+        return job;
+    }
+    if source.is_empty() {
+        job.append("", 0.0, format_for(None, MarkerMask::NONE));
+        return job;
+    }
+    for run in &plan.runs {
+        job.append(
+            &source[run.byte_range.clone()],
+            0.0,
+            format_for(run.syntax, run.markers),
+        );
+    }
+    job
 }
 
 pub fn build_layout_job(
@@ -720,4 +1210,405 @@ pub fn gutter_digits(line_count: usize) -> usize {
         digits += 1;
     }
     digits
+}
+
+#[cfg(test)]
+mod prepared_layout_tests {
+    use super::*;
+    use crate::{DocumentId, EditRevision};
+    use eframe::egui::{Color32, FontId, Stroke};
+
+    fn document(edit_revision: u64) -> DocumentStamp {
+        DocumentStamp {
+            document_id: DocumentId::from_raw(91).expect("nonzero document id"),
+            edit_revision: EditRevision::from_raw(edit_revision).expect("nonzero edit revision"),
+        }
+    }
+
+    fn document_range(
+        mapper: &SourceMapper,
+        document: DocumentStamp,
+        bytes: Range<usize>,
+    ) -> DocumentRange {
+        let start = mapper
+            .position_at(bytes.start)
+            .expect("test start is a scalar boundary");
+        let end = mapper
+            .position_at(bytes.end)
+            .expect("test end is a scalar boundary");
+        DocumentRange::new(document, bytes, start.char_index..end.char_index)
+    }
+
+    fn test_format(syntax: Option<SyntaxClass>, markers: MarkerMask) -> TextFormat {
+        let color = match syntax {
+            Some(SyntaxClass::Keyword) => Color32::from_rgb(1, 2, 3),
+            Some(SyntaxClass::Comment) => Color32::from_rgb(4, 5, 6),
+            Some(SyntaxClass::String) => Color32::from_rgb(7, 8, 9),
+            Some(SyntaxClass::Number) => Color32::from_rgb(10, 11, 12),
+            Some(SyntaxClass::Variable) => Color32::from_rgb(13, 14, 15),
+            Some(SyntaxClass::Operator) => Color32::from_rgb(16, 17, 18),
+            None => Color32::BLACK,
+        };
+        let mut format = TextFormat {
+            font_id: FontId::monospace(14.0),
+            color,
+            ..Default::default()
+        };
+        match markers.primary() {
+            Some(MarkerKind::Fault) => {
+                format.background = Color32::from_rgb(255, 220, 220);
+                format.underline = Stroke::new(1.5, Color32::from_rgb(180, 35, 35));
+            }
+            Some(MarkerKind::Current) => {
+                format.background = Color32::from_rgb(255, 242, 184);
+            }
+            Some(MarkerKind::Navigation) => {
+                format.background = Color32::from_rgb(218, 234, 255);
+                format.underline = Stroke::new(1.0, Color32::from_rgb(42, 101, 172));
+            }
+            None => {}
+        }
+        format
+    }
+
+    fn decorations_by_byte(job: &LayoutJob, source_bytes: usize) -> Vec<(Color32, Stroke)> {
+        let mut decorations = vec![(Color32::TRANSPARENT, Stroke::NONE); source_bytes];
+        for section in &job.sections {
+            for decoration in &mut decorations[section.byte_range.start.0..section.byte_range.end.0]
+            {
+                *decoration = (section.format.background, section.format.underline);
+            }
+        }
+        decorations
+    }
+
+    #[test]
+    fn prepared_layout_preserves_all_six_syntax_classes() {
+        let stamp = document(1);
+        let source = "k c s n v o";
+        let mapper = SourceMapper::for_document(stamp, source);
+        let markers = mapper.resolve_document_markers(DocumentMarkerInputs::default());
+        let classes = [
+            SyntaxClass::Keyword,
+            SyntaxClass::Comment,
+            SyntaxClass::String,
+            SyntaxClass::Number,
+            SyntaxClass::Variable,
+            SyntaxClass::Operator,
+        ];
+        let syntax = classes
+            .into_iter()
+            .enumerate()
+            .map(|(index, class)| {
+                let start = index * 2;
+                PreparedSyntaxRun::new(document_range(&mapper, stamp, start..start + 1), class)
+            })
+            .collect::<Vec<_>>();
+
+        let plan = PreparedLayoutPlan::compose(&mapper, &markers, &syntax);
+
+        assert_eq!(plan.syntax_rejection(), None);
+        assert_eq!(
+            plan.runs()
+                .iter()
+                .filter_map(|run| run.syntax)
+                .collect::<Vec<_>>(),
+            classes
+        );
+    }
+
+    #[test]
+    fn document_mapper_validates_run_provenance_before_neutralizing_a_span() {
+        let stamp = document(2);
+        let source = "print 1;";
+        let run = RunBinding {
+            worker_session_id: crate::WorkerSessionId(7),
+            run_id: crate::RunId(8),
+            source_id: SourceId(9),
+            source_revision: rlox_protocol::RevisionId(10),
+        };
+        let source_key = EditorSourceKey::new(stamp, run);
+        let mapper = SourceMapper::for_document(stamp, source);
+        let marker = MarkerSpan::new(
+            source_key,
+            SourceSpan {
+                source_id: run.source_id,
+                revision: run.source_revision,
+                start: TextPosition {
+                    byte_offset: 0,
+                    line: 1,
+                    column: 1,
+                },
+                end: TextPosition {
+                    byte_offset: 5,
+                    line: 1,
+                    column: 6,
+                },
+            },
+        );
+
+        let neutral = mapper
+            .map_run_range(source_key, marker)
+            .expect("exact run source is accepted");
+        assert_eq!(neutral.byte_range, 0..5);
+        assert_eq!(neutral.char_range, CharIndex(0)..CharIndex(5));
+
+        let stale_run = EditorSourceKey::new(
+            stamp,
+            RunBinding {
+                run_id: crate::RunId(11),
+                ..run
+            },
+        );
+        assert!(matches!(
+            mapper.map_run_span(source_key, MarkerSpan::new(stale_run, marker.span)),
+            Err(SpanMapError::StaleRun { .. })
+        ));
+
+        let mapper_bound_to_stale_run = SourceMapper::new(stale_run, source);
+        assert!(matches!(
+            mapper_bound_to_stale_run.map_run_span(source_key, marker),
+            Err(SpanMapError::StaleRun { .. })
+        ));
+    }
+
+    #[test]
+    fn adjacent_unicode_syntax_ranges_keep_exact_byte_and_character_boundaries() {
+        let stamp = document(3);
+        let source = "a🦀語z";
+        let mapper = SourceMapper::for_document(stamp, source);
+        let markers = mapper.resolve_document_markers(DocumentMarkerInputs::default());
+        let syntax = [
+            PreparedSyntaxRun::new(document_range(&mapper, stamp, 0..1), SyntaxClass::Keyword),
+            PreparedSyntaxRun::new(document_range(&mapper, stamp, 1..5), SyntaxClass::String),
+            PreparedSyntaxRun::new(document_range(&mapper, stamp, 5..8), SyntaxClass::Variable),
+            PreparedSyntaxRun::new(document_range(&mapper, stamp, 8..9), SyntaxClass::Operator),
+        ];
+
+        let plan = PreparedLayoutPlan::compose(&mapper, &markers, &syntax);
+
+        assert_eq!(plan.syntax_rejection(), None);
+        assert_eq!(
+            plan.runs()
+                .iter()
+                .map(|run| (run.byte_range.clone(), run.char_range.clone(), run.syntax))
+                .collect::<Vec<_>>(),
+            vec![
+                (0..1, CharIndex(0)..CharIndex(1), Some(SyntaxClass::Keyword)),
+                (1..5, CharIndex(1)..CharIndex(2), Some(SyntaxClass::String)),
+                (
+                    5..8,
+                    CharIndex(2)..CharIndex(3),
+                    Some(SyntaxClass::Variable),
+                ),
+                (
+                    8..9,
+                    CharIndex(3)..CharIndex(4),
+                    Some(SyntaxClass::Operator),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_syntax_is_discarded_without_removing_valid_markers() {
+        let stamp = document(4);
+        let source = "a🦀bcdef\nz";
+        let mapper = SourceMapper::for_document(stamp, source);
+        let markers = mapper.resolve_document_markers(DocumentMarkerInputs {
+            current: Some(document_range(&mapper, stamp, 0..5)),
+            fault: Some(document_range(&mapper, stamp, 1..7)),
+            navigation: Some(document_range(&mapper, stamp, 5..10)),
+        });
+        let marker_only = PreparedLayoutPlan::compose(&mapper, &markers, &[]);
+        let valid = |range| PreparedSyntaxRun::new(range, SyntaxClass::Keyword);
+
+        let stale_same_length = vec![valid(document_range(&mapper, document(3), 0..1))];
+        let reversed_start = 5;
+        let reversed_end = 1;
+        let reversed = vec![valid(DocumentRange::new(
+            stamp,
+            reversed_start..reversed_end,
+            CharIndex(2)..CharIndex(1),
+        ))];
+        let overlapping = vec![
+            valid(document_range(&mapper, stamp, 0..5)),
+            valid(document_range(&mapper, stamp, 1..6)),
+        ];
+        let out_of_bounds = vec![valid(DocumentRange::new(
+            stamp,
+            source.len()..source.len() + 1,
+            CharIndex(mapper.total_chars())..CharIndex(mapper.total_chars() + 1),
+        ))];
+        let wrong_character_range = vec![valid(DocumentRange::new(
+            stamp,
+            1..5,
+            CharIndex(0)..CharIndex(2),
+        ))];
+        let over_limit =
+            vec![valid(document_range(&mapper, stamp, 0..1)); MAX_PREPARED_SYNTAX_RUNS + 1];
+
+        let plans = [
+            stale_same_length,
+            reversed,
+            overlapping,
+            out_of_bounds,
+            wrong_character_range,
+            over_limit,
+        ]
+        .iter()
+        .map(|malformed| PreparedLayoutPlan::compose(&mapper, &markers, malformed))
+        .collect::<Vec<_>>();
+
+        assert!(matches!(
+            plans[0].syntax_rejection(),
+            Some(SyntaxPlanRejection::InvalidRun {
+                error: SpanMapError::StaleDocument { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            plans[1].syntax_rejection(),
+            Some(SyntaxPlanRejection::InvalidRun {
+                error: SpanMapError::Reversed,
+                ..
+            })
+        ));
+        assert!(matches!(
+            plans[2].syntax_rejection(),
+            Some(SyntaxPlanRejection::UnsortedOrOverlapping { index: 1 })
+        ));
+        assert!(matches!(
+            plans[3].syntax_rejection(),
+            Some(SyntaxPlanRejection::InvalidRun {
+                error: SpanMapError::OutOfBounds { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            plans[4].syntax_rejection(),
+            Some(SyntaxPlanRejection::InvalidRun {
+                error: SpanMapError::CharacterRangeMismatch { .. },
+                ..
+            })
+        ));
+        assert_eq!(
+            plans[5].syntax_rejection(),
+            Some(SyntaxPlanRejection::TooManyRuns {
+                actual: MAX_PREPARED_SYNTAX_RUNS + 1,
+                maximum: MAX_PREPARED_SYNTAX_RUNS,
+            })
+        );
+
+        for plan in plans {
+            assert_eq!(plan.runs(), marker_only.runs());
+            assert_eq!(plan.gutter_markers(), marker_only.gutter_markers());
+            assert_eq!(plan.point_markers(), marker_only.point_markers());
+            assert_eq!(plan.rejected_markers(), marker_only.rejected_markers());
+        }
+    }
+
+    #[test]
+    fn syntax_changes_only_foreground_and_preserves_every_marker_decoration() {
+        let stamp = document(5);
+        let source = "a🦀bcdef";
+        let mapper = SourceMapper::for_document(stamp, source);
+        let markers = mapper.resolve_document_markers(DocumentMarkerInputs {
+            current: Some(document_range(&mapper, stamp, 0..5)),
+            fault: Some(document_range(&mapper, stamp, 1..7)),
+            navigation: Some(document_range(&mapper, stamp, 5..10)),
+        });
+        let marker_only = PreparedLayoutPlan::compose(&mapper, &markers, &[]);
+        let with_syntax = PreparedLayoutPlan::compose(
+            &mapper,
+            &markers,
+            &[
+                PreparedSyntaxRun::new(document_range(&mapper, stamp, 0..6), SyntaxClass::Keyword),
+                PreparedSyntaxRun::new(document_range(&mapper, stamp, 6..10), SyntaxClass::Comment),
+            ],
+        );
+
+        let plain_job = build_prepared_layout_job(stamp, source, &marker_only, test_format);
+        let syntax_job = build_prepared_layout_job(stamp, source, &with_syntax, test_format);
+
+        assert_eq!(plain_job.text, source);
+        assert_eq!(syntax_job.text, source);
+        assert_eq!(
+            decorations_by_byte(&plain_job, source.len()),
+            decorations_by_byte(&syntax_job, source.len())
+        );
+        assert_eq!(marker_only.gutter_markers(), with_syntax.gutter_markers());
+        assert_eq!(marker_only.point_markers(), with_syntax.point_markers());
+        assert!(
+            syntax_job
+                .sections
+                .iter()
+                .any(|section| section.format.color != Color32::BLACK)
+        );
+    }
+
+    #[test]
+    fn maximum_syntax_plan_merges_with_markers_within_a_linear_operation_bound() {
+        let stamp = document(6);
+        let source = "x".repeat(MAX_PREPARED_SYNTAX_RUNS);
+        let mapper = SourceMapper::for_document(stamp, &source);
+        let markers = mapper.resolve_document_markers(DocumentMarkerInputs {
+            current: Some(document_range(&mapper, stamp, 100..3_000)),
+            fault: Some(document_range(&mapper, stamp, 1_000..2_000)),
+            navigation: Some(document_range(&mapper, stamp, 2_500..4_000)),
+        });
+        let syntax = (0..MAX_PREPARED_SYNTAX_RUNS)
+            .map(|offset| {
+                PreparedSyntaxRun::new(
+                    document_range(&mapper, stamp, offset..offset + 1),
+                    match offset % 6 {
+                        0 => SyntaxClass::Keyword,
+                        1 => SyntaxClass::Comment,
+                        2 => SyntaxClass::String,
+                        3 => SyntaxClass::Number,
+                        4 => SyntaxClass::Variable,
+                        _ => SyntaxClass::Operator,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let plan = PreparedLayoutPlan::compose(&mapper, &markers, &syntax);
+        let bound = 4 * (syntax.len() + markers.format_runs().len() + 1);
+
+        assert_eq!(plan.syntax_rejection(), None);
+        assert_eq!(plan.runs().len(), MAX_PREPARED_SYNTAX_RUNS);
+        assert!(
+            plan.merge_operations() > syntax.len(),
+            "the counter must charge pointer advancement as well as emitted runs"
+        );
+        assert!(
+            plan.merge_operations() <= bound,
+            "{} merge operations exceeded the {bound} operation bound",
+            plan.merge_operations()
+        );
+    }
+
+    #[test]
+    fn layouter_rejects_a_same_byte_length_source_with_different_character_identity() {
+        let stamp = document(7);
+        let mapper = SourceMapper::for_document(stamp, "é");
+        let markers = mapper.resolve_document_markers(DocumentMarkerInputs::default());
+        let plan = PreparedLayoutPlan::compose(
+            &mapper,
+            &markers,
+            &[PreparedSyntaxRun::new(
+                document_range(&mapper, stamp, 0..2),
+                SyntaxClass::Keyword,
+            )],
+        );
+
+        let job = build_prepared_layout_job(stamp, "ab", &plan, test_format);
+
+        assert_eq!(job.text, "ab");
+        assert_eq!(job.sections.len(), 1);
+        assert_eq!(job.sections[0].format.color, Color32::BLACK);
+        assert_eq!(job.sections[0].format.background, Color32::TRANSPARENT);
+        assert_eq!(job.sections[0].format.underline, Stroke::NONE);
+    }
 }
