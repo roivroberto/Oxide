@@ -44,6 +44,13 @@ checked_id!(ClientCommandId);
 checked_id!(FileOperationId);
 checked_id!(ProblemId);
 checked_id!(CloseRequestId);
+checked_id!(NavigationGeneration);
+
+impl NavigationGeneration {
+    pub fn checked_next(self) -> Option<Self> {
+        self.0.checked_add(1).and_then(Self::from_raw)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DocumentStamp {
@@ -110,6 +117,10 @@ impl DocumentBuffer {
 
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    pub fn shared_text(&self) -> Arc<str> {
+        Arc::clone(&self.text)
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -364,9 +375,10 @@ pub enum ModelEffect {
         contents: Arc<[u8]>,
     },
     Navigate {
+        navigation_generation: NavigationGeneration,
         document: DocumentStamp,
         run: RunBinding,
-        span: SourceSpan,
+        span: Box<SourceSpan>,
     },
     AuthorizeClose {
         close_request_id: CloseRequestId,
@@ -407,8 +419,12 @@ pub enum UiAction {
         operation_id: FileOperationId,
         choice: UnsavedChoice,
     },
-    SelectProblem(ProblemId),
+    SelectProblem {
+        navigation_generation: NavigationGeneration,
+        problem_id: ProblemId,
+    },
     SelectFrame {
+        navigation_generation: NavigationGeneration,
         snapshot: SnapshotKey,
         activation_id: ActivationId,
     },
@@ -820,7 +836,6 @@ pub struct AppModel {
     problems_truncated: bool,
     current_span: Option<SourceSpan>,
     fault_span: Option<SourceSpan>,
-    navigation_span: Option<SourceSpan>,
     retained_snapshot: Option<RetainedSnapshot>,
     selected_activation: Option<ActivationId>,
     selected_problem: Option<ProblemId>,
@@ -860,7 +875,6 @@ impl AppModel {
             problems_truncated: false,
             current_span: None,
             fault_span: None,
-            navigation_span: None,
             retained_snapshot: None,
             selected_activation: None,
             selected_problem: None,
@@ -993,10 +1007,6 @@ impl AppModel {
         self.fault_span
     }
 
-    pub fn navigation_span(&self) -> Option<SourceSpan> {
-        self.navigation_span
-    }
-
     pub fn retained_snapshot(&self) -> Option<&RetainedSnapshot> {
         self.retained_snapshot.as_ref()
     }
@@ -1121,11 +1131,15 @@ fn apply_ui_action(model: &mut AppModel, action: UiAction) -> Vec<ModelEffect> {
             operation_id,
             choice,
         } => resolve_unsaved(model, operation_id, choice),
-        UiAction::SelectProblem(problem_id) => select_problem(model, problem_id),
+        UiAction::SelectProblem {
+            navigation_generation,
+            problem_id,
+        } => select_problem(model, navigation_generation, problem_id),
         UiAction::SelectFrame {
+            navigation_generation,
             snapshot,
             activation_id,
-        } => select_frame(model, snapshot, activation_id),
+        } => select_frame(model, navigation_generation, snapshot, activation_id),
     }
 }
 
@@ -1168,7 +1182,6 @@ fn apply_edit(model: &mut AppModel, stamp: DocumentStamp, text: String) {
         model.execution_state = ExecutionViewState::Idle;
         clear_source_artifacts(model);
     } else {
-        model.navigation_span = None;
         model.selected_problem = None;
     }
 }
@@ -1314,7 +1327,6 @@ fn clear_source_artifacts(model: &mut AppModel) {
     model.problems_truncated = false;
     model.current_span = None;
     model.fault_span = None;
-    model.navigation_span = None;
     model.retained_snapshot = None;
     model.selected_activation = None;
     model.selected_problem = None;
@@ -2679,7 +2691,11 @@ fn mark_desynchronized(model: &mut AppModel) -> Vec<ModelEffect> {
     }]
 }
 
-fn select_problem(model: &mut AppModel, problem_id: ProblemId) -> Vec<ModelEffect> {
+fn select_problem(
+    model: &mut AppModel,
+    navigation_generation: NavigationGeneration,
+    problem_id: ProblemId,
+) -> Vec<ModelEffect> {
     let Some(problem) = model
         .problems
         .iter()
@@ -2698,16 +2714,17 @@ fn select_problem(model: &mut AppModel, problem_id: ProblemId) -> Vec<ModelEffec
     let document = problem.document;
     let run = problem.run;
     model.selected_problem = Some(problem_id);
-    model.navigation_span = Some(span);
     vec![ModelEffect::Navigate {
+        navigation_generation,
         document,
         run,
-        span,
+        span: Box::new(span),
     }]
 }
 
 fn select_frame(
     model: &mut AppModel,
+    navigation_generation: NavigationGeneration,
     snapshot_key: SnapshotKey,
     activation_id: ActivationId,
 ) -> Vec<ModelEffect> {
@@ -2734,10 +2751,10 @@ fn select_frame(
     let document = retained.document;
     let run = retained.run;
     model.selected_activation = Some(activation_id);
-    model.navigation_span = Some(span);
     vec![ModelEffect::Navigate {
+        navigation_generation,
         document,
         run,
-        span,
+        span: Box::new(span),
     }]
 }

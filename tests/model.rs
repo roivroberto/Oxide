@@ -1,13 +1,14 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use oxide_ide::{
     AppModel, ClientStartId, ClientSubmission, ClosureHealth, ControlAvailability, Envelope,
     EventSequence, ExecutionViewState, FileFailureKind, FileModelEvent, MAX_OPEN_FILE_BYTES,
     MAX_SOURCE_LINES, MAX_VISIBLE_OUTPUT_BYTES, MAX_VISIBLE_OUTPUT_LINES,
-    MAX_WIRE_DOCUMENT_JSON_BYTES, ModelEffect, ModelEvent, ModelStatus, OUTPUT_TRUNCATION_MARKER,
-    RequestId, RunBinding, RunId, RunMode, SnapshotProvenance, SupervisorModelEvent, UiAction,
-    UnsavedChoice, WireDiagnostic, WireRuntimeFrame, WorkerEvent, WorkerSessionId,
-    WorkerTerminationReason, apply_event,
+    MAX_WIRE_DOCUMENT_JSON_BYTES, ModelEffect, ModelEvent, ModelStatus, NavigationGeneration,
+    OUTPUT_TRUNCATION_MARKER, RequestId, RunBinding, RunId, RunMode, SnapshotKey,
+    SnapshotProvenance, SupervisorModelEvent, UiAction, UnsavedChoice, WireDiagnostic,
+    WireRuntimeFrame, WorkerEvent, WorkerSessionId, WorkerTerminationReason, apply_event,
 };
 use rlox_protocol::{
     ActivationId, DebugPointId, DiagnosticPhase, DiagnosticSeverity, FrameSnapshot, PauseLocation,
@@ -52,6 +53,27 @@ fn set_source(model: &mut AppModel, source: &str) {
         )
         .is_empty()
     );
+}
+
+#[test]
+fn document_shared_text_reuses_the_model_allocation() {
+    let mut model = AppModel::new();
+    set_source(&mut model, SOURCE);
+    let document = model.document().expect("document");
+
+    let first = document.shared_text();
+    let second = document.shared_text();
+
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(first.as_ref(), document.text());
+}
+
+#[test]
+fn navigation_generation_accepts_the_last_value_and_then_fails_closed() {
+    let last = NavigationGeneration::from_raw(u64::MAX).expect("maximum value is valid");
+
+    assert_eq!(last.get(), u64::MAX);
+    assert_eq!(last.checked_next(), None);
 }
 
 fn begin_start(model: &mut AppModel, mode: RunMode) -> ClientStartId {
@@ -568,10 +590,12 @@ fn frame_and_problem_navigation_do_not_overwrite_execution_or_fault_markers() {
         worker(run, 2, 1, paused_event(run, 2, PauseReason::DebugPoint)),
     );
     let current = model.current_span();
+    let frame_document = model.document().expect("document").stamp();
     let snapshot_key = model.retained_snapshot().unwrap().key();
     let effects = apply_event(
         &mut model,
         ModelEvent::Ui(UiAction::SelectFrame {
+            navigation_generation: NavigationGeneration::from_raw(7).unwrap(),
             snapshot: snapshot_key,
             activation_id: ActivationId(7),
         }),
@@ -579,9 +603,14 @@ fn frame_and_problem_navigation_do_not_overwrite_execution_or_fault_markers() {
     assert!(matches!(
         effects.as_slice(),
         [ModelEffect::Navigate {
+            navigation_generation,
+            document,
             run: effect_run,
-            ..
-        }] if *effect_run == run
+            span,
+        }] if navigation_generation.get() == 7
+            && *document == frame_document
+            && *effect_run == run
+            && Some(**span) == current
     ));
     assert_eq!(model.current_span(), current);
     assert_eq!(model.fault_span(), None);
@@ -614,19 +643,68 @@ fn frame_and_problem_navigation_do_not_overwrite_execution_or_fault_markers() {
     );
     let fault = faulted.fault_span();
     let problem = faulted.problems()[0].id();
+    let problem_document = faulted.problems()[0].document();
+    let problem_span = faulted.problems()[0].diagnostic().span;
     let effects = apply_event(
         &mut faulted,
-        ModelEvent::Ui(UiAction::SelectProblem(problem)),
+        ModelEvent::Ui(UiAction::SelectProblem {
+            navigation_generation: NavigationGeneration::from_raw(8).unwrap(),
+            problem_id: problem,
+        }),
     );
     assert!(matches!(
         effects.as_slice(),
         [ModelEffect::Navigate {
+            navigation_generation,
+            document,
             run: effect_run,
-            ..
-        }] if *effect_run == run
+            span,
+        }] if navigation_generation.get() == 8
+            && *document == problem_document
+            && *effect_run == run
+            && **span == problem_span
     ));
     assert_eq!(faulted.fault_span(), fault);
-    assert!(faulted.navigation_span().is_some());
+
+    let stale_frame = SnapshotKey {
+        run,
+        sequence: EventSequence(snapshot_key.sequence.0 + 1),
+    };
+    assert!(
+        apply_event(
+            &mut model,
+            ModelEvent::Ui(UiAction::SelectFrame {
+                navigation_generation: NavigationGeneration::from_raw(9).unwrap(),
+                snapshot: stale_frame,
+                activation_id: ActivationId(7),
+            }),
+        )
+        .is_empty()
+    );
+    assert_eq!(model.selected_activation(), Some(ActivationId(7)));
+
+    let stale_stamp = faulted.document().expect("document").stamp();
+    assert!(
+        apply_event(
+            &mut faulted,
+            ModelEvent::Ui(UiAction::Edit {
+                document: stale_stamp,
+                text: "print 2;".to_owned(),
+            }),
+        )
+        .is_empty()
+    );
+    assert!(
+        apply_event(
+            &mut faulted,
+            ModelEvent::Ui(UiAction::SelectProblem {
+                navigation_generation: NavigationGeneration::from_raw(10).unwrap(),
+                problem_id: problem,
+            }),
+        )
+        .is_empty()
+    );
+    assert_eq!(faulted.selected_problem(), None);
 }
 
 #[test]

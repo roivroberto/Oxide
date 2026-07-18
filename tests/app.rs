@@ -622,10 +622,11 @@ fn problem_and_frame_buttons_emit_exact_provenance_and_symbols_are_visible() {
     assert!(matches!(
         effects.as_slice(),
         [ModelEffect::Navigate {
+            navigation_generation,
             document: _,
             run: actual,
             span: _
-        }] if *actual == run
+        }] if navigation_generation.get() == 1 && *actual == run
     ));
 
     harness.get_by_label("Call Stack").click();
@@ -649,7 +650,11 @@ fn problem_and_frame_buttons_emit_exact_provenance_and_symbols_are_visible() {
     );
     assert!(matches!(
         harness.state_mut().take_pending_effects().as_slice(),
-        [ModelEffect::Navigate { run: actual, .. }] if *actual == run
+        [ModelEffect::Navigate {
+            navigation_generation,
+            run: actual,
+            ..
+        }] if navigation_generation.get() == 2 && *actual == run
     ));
 
     harness.get_by_label("Symbols").click();

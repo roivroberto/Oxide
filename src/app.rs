@@ -14,13 +14,13 @@ use crate::file_dialog::{
     show_unsaved_dialog,
 };
 use crate::{
-    AppModel, BindingScope, BoundedTextBuffer, DocumentStamp, EditorSourceKey, ExecutionViewState,
-    FileFailureKind, MarkerInputs, MarkerKind, MarkerMask, MarkerPlan, MarkerSpan, ModelEffect,
-    ModelEvent, ModelStatus, PresentedBinding, PresentedValue, PresentedValueState, RequestId,
-    RuntimeCoordinator, RuntimeDispatchError, SourceGrowthLimit, SourceMapper, SupervisorConfig,
-    SupervisorModelEvent, UiAction, ValuePath, apply_event, build_layout_job, escape_display_text,
-    frame_accessible_name, gutter_digits, present_binding, snapshot_accessible_name,
-    snapshot_provenance_label,
+    ActivationId, AppModel, BindingScope, BoundedTextBuffer, DocumentStamp, EditorSourceKey,
+    ExecutionViewState, FileFailureKind, MarkerInputs, MarkerKind, MarkerMask, MarkerPlan,
+    MarkerSpan, ModelEffect, ModelEvent, ModelStatus, NavigationGeneration, PresentedBinding,
+    PresentedValue, PresentedValueState, RequestId, RuntimeCoordinator, RuntimeDispatchError,
+    SnapshotKey, SourceGrowthLimit, SourceMapper, SupervisorConfig, SupervisorModelEvent, UiAction,
+    ValuePath, apply_event, build_layout_job, escape_display_text, frame_accessible_name,
+    gutter_digits, present_binding, snapshot_accessible_name, snapshot_provenance_label,
 };
 
 const MAX_PENDING_EVENTS_PER_PASS: usize = 32;
@@ -103,6 +103,7 @@ pub struct OxideApp {
     queued_events: VecDeque<ModelEvent>,
     deferred_actions: VecDeque<AppAction>,
     deferred_ui_actions: VecDeque<UiAction>,
+    next_navigation_generation: Option<NavigationGeneration>,
     pending_effects: VecDeque<ModelEffect>,
     editor_text: String,
     editor_stamp: Option<DocumentStamp>,
@@ -194,6 +195,7 @@ impl OxideApp {
             queued_events: VecDeque::new(),
             deferred_actions: VecDeque::new(),
             deferred_ui_actions: VecDeque::new(),
+            next_navigation_generation: NavigationGeneration::from_raw(1),
             pending_effects: VecDeque::new(),
             editor_text,
             editor_stamp,
@@ -461,6 +463,12 @@ impl OxideApp {
         ctx.request_repaint();
     }
 
+    fn allocate_navigation_generation(&mut self) -> Option<NavigationGeneration> {
+        let generation = self.next_navigation_generation?;
+        self.next_navigation_generation = generation.checked_next();
+        Some(generation)
+    }
+
     fn flush_deferred_actions(&mut self, ctx: &egui::Context) {
         if self.deferred_actions.is_empty() && self.deferred_ui_actions.is_empty() {
             return;
@@ -707,13 +715,14 @@ impl OxideApp {
                     });
                 }
                 ModelEffect::Navigate {
+                    navigation_generation: _,
                     document,
                     run,
                     span,
                 } => {
                     self.pending_navigation = Some(MarkerSpan::new(
                         crate::EditorSourceKey::new(document, run),
-                        span,
+                        *span,
                     ));
                     self.navigation_focus_pending = true;
                 }
@@ -1015,8 +1024,16 @@ impl OxideApp {
                         }
                     });
             });
-        if let Some(problem_id) = selected_problem {
-            self.defer_ui_action(ui.ctx(), UiAction::SelectProblem(problem_id));
+        if let Some(problem_id) = selected_problem
+            && let Some(navigation_generation) = self.allocate_navigation_generation()
+        {
+            self.defer_ui_action(
+                ui.ctx(),
+                UiAction::SelectProblem {
+                    navigation_generation,
+                    problem_id,
+                },
+            );
         }
         if let Some((request_id, text)) = submitted_input {
             self.input_submitted_for = Some(request_id);
@@ -1057,8 +1074,17 @@ impl OxideApp {
                         }
                     });
             });
-        if let Some(action) = selected_frame {
-            self.defer_ui_action(ui.ctx(), action);
+        if let Some((snapshot, activation_id)) = selected_frame
+            && let Some(navigation_generation) = self.allocate_navigation_generation()
+        {
+            self.defer_ui_action(
+                ui.ctx(),
+                UiAction::SelectFrame {
+                    navigation_generation,
+                    snapshot,
+                    activation_id,
+                },
+            );
         }
     }
 
@@ -1068,10 +1094,20 @@ impl OxideApp {
         if self.editor_text != document.text() {
             return None;
         }
-        if self.pending_navigation.is_some_and(|navigation| {
-            navigation.source.document != document_stamp
-                || self.model.navigation_span() != Some(navigation.span)
-        }) {
+        let navigation_is_current = self.pending_navigation.is_none_or(|navigation| {
+            navigation.source.document == document_stamp
+                && (self.model.active_run() == Some(navigation.source.run)
+                    || self.model.retained_snapshot().is_some_and(|snapshot| {
+                        snapshot.document() == document_stamp
+                            && snapshot.run() == navigation.source.run
+                    })
+                    || self.model.problems().iter().any(|problem| {
+                        problem.document() == document_stamp
+                            && problem.run() == navigation.source.run
+                            && problem.diagnostic().span == navigation.span
+                    }))
+        });
+        if !navigation_is_current {
             self.pending_navigation = None;
             self.navigation_focus_pending = false;
         }
@@ -1093,7 +1129,7 @@ impl OxideApp {
         if self
             .editor_mapper
             .as_ref()
-            .is_none_or(|mapper| mapper.key() != source)
+            .is_none_or(|mapper| mapper.run_key() != Some(source))
         {
             self.editor_mapper = Some(SourceMapper::new(source, &self.editor_text));
         }
@@ -1379,7 +1415,7 @@ impl Drop for OxideApp {
     }
 }
 
-fn show_call_stack(ui: &mut egui::Ui, model: &AppModel) -> Option<UiAction> {
+fn show_call_stack(ui: &mut egui::Ui, model: &AppModel) -> Option<(SnapshotKey, ActivationId)> {
     let Some(retained) = model.retained_snapshot() else {
         ui.label("Call frames appear while debugging.");
         return None;
@@ -1401,10 +1437,7 @@ fn show_call_stack(ui: &mut egui::Ui, model: &AppModel) -> Option<UiAction> {
             )
             .clicked()
         {
-            selected = Some(UiAction::SelectFrame {
-                snapshot: retained.key(),
-                activation_id: frame.activation_id,
-            });
+            selected = Some((retained.key(), frame.activation_id));
         }
     }
     if snapshot.frames_truncated {
@@ -1749,6 +1782,17 @@ mod tests {
 
     use super::*;
     use crate::FileModelEvent;
+
+    #[test]
+    fn navigation_allocator_uses_the_last_generation_once_then_fails_closed() {
+        let mut app = OxideApp::headless(AppModel::new());
+        let last = NavigationGeneration::from_raw(u64::MAX).expect("maximum value is valid");
+        app.next_navigation_generation = Some(last);
+
+        assert_eq!(app.allocate_navigation_generation(), Some(last));
+        assert_eq!(app.allocate_navigation_generation(), None);
+        assert_eq!(app.allocate_navigation_generation(), None);
+    }
 
     #[test]
     fn file_disconnect_finishes_the_exact_accepted_operation_once() {
