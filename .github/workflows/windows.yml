@@ -77,8 +77,28 @@ jobs:
           --
           --check
 
+      - name: Build pinned RLox test worker
+        id: test-worker
+        shell: pwsh
+        run: |
+          $targetDirectory = Join-Path $env:RUNNER_TEMP "oxide-rlox-test-worker"
+          cargo build `
+            --locked `
+            --manifest-path "$env:GITHUB_WORKSPACE/_backend/rlox/Cargo.toml" `
+            --target $env:WINDOWS_TARGET `
+            --target-dir $targetDirectory `
+            -p rlox `
+            --bin rlox
+          $executable = Join-Path $targetDirectory "$env:WINDOWS_TARGET/debug/rlox.exe"
+          if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+              throw "Pinned RLox test worker is missing."
+          }
+          "executable=$executable" >> $env:GITHUB_OUTPUT
+
       - name: Test Oxide
         shell: pwsh
+        env:
+          RLOX_TEST_EXECUTABLE: ${{ steps.test-worker.outputs.executable }}
         run: >-
           cargo test
           --locked

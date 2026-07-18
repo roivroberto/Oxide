@@ -10,16 +10,37 @@ use oxide_ide::{
 
 fn config() -> SupervisorConfig {
     SupervisorConfig {
-        executable: std::env::current_exe()
-            .expect("resolve test executable")
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("Cargo target profile directory")
-            .join(if cfg!(windows) { "rlox.exe" } else { "rlox" }),
+        executable: test_worker_executable(),
         handshake_timeout: Duration::from_secs(5),
         stop_timeout: Duration::from_secs(5),
         shutdown_timeout: Duration::from_secs(5),
     }
+}
+
+fn test_worker_executable() -> PathBuf {
+    if let Some(executable) = std::env::var_os("RLOX_TEST_EXECUTABLE") {
+        assert!(!executable.is_empty(), "RLOX_TEST_EXECUTABLE is empty");
+        let executable = PathBuf::from(executable);
+        assert!(
+            executable.is_file(),
+            "RLOX_TEST_EXECUTABLE is not a file: {}",
+            executable.display()
+        );
+        return executable;
+    }
+
+    let executable = std::env::current_exe()
+        .expect("resolve test executable")
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("Cargo target profile directory")
+        .join(if cfg!(windows) { "rlox.exe" } else { "rlox" });
+    assert!(
+        executable.is_file(),
+        "RLox test worker is missing; set RLOX_TEST_EXECUTABLE to the pinned rlox binary: {}",
+        executable.display()
+    );
+    executable
 }
 
 fn next_event(supervisor: &WorkerSupervisor) -> SupervisorEvent {
