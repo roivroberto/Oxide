@@ -861,7 +861,10 @@ mod language_worker_process {
                 return;
             };
             if let Err(error) = bounded_child_cleanup(child) {
-                eprintln!("language worker test cleanup failed: {error}");
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "language worker test cleanup failed: {error}"
+                );
             }
         }
     }
@@ -875,7 +878,12 @@ mod language_worker_process {
                     .map_err(|error| format!("could not reap exited child: {error}"));
             }
             Ok(None) => {}
-            Err(error) => eprintln!("language worker cleanup status check failed: {error}"),
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "language worker cleanup status check failed: {error}"
+                );
+            }
         }
 
         let kill_error = child.kill().err();
