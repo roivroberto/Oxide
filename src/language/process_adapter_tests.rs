@@ -1,4 +1,3 @@
-#[cfg(unix)]
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
@@ -21,7 +20,7 @@ use super::process_adapter::{
     FatalSideband, InboxBudget, IoStop, LanguageProcessAdapter, LanguageProcessConfig,
     ReaderThreadOutcome, SiblingResolutionError, WriterCompletion, WriterHandoffError,
     WriterOutcomeSlot, WriterThreadOutcome, after_owner_drop, join_if_completed, reader_lane,
-    reader_lane_with_wake, resolve_cleanup_owner, resolve_sibling_lsp_from, run_lane_cleanup,
+    reader_lane_with_wake, resolve_cleanup_owner, resolve_language_command_from, run_lane_cleanup,
     run_reader, run_writer, writer_input,
 };
 #[cfg(not(windows))]
@@ -29,28 +28,52 @@ use super::process_adapter::{CleanupProcessOps, run_process_cleanup};
 use super::snapshot::{ProcessGeneration, WriteSequence};
 
 #[test]
-fn sibling_resolver_uses_only_the_exact_absolute_peer() {
+fn language_command_uses_the_platform_specific_executable() {
     let executable = if cfg!(windows) {
         PathBuf::from(r"C:\oxide\oxide-ide.exe")
     } else {
         PathBuf::from("/opt/oxide/oxide-ide")
     };
-    let expected = executable.parent().unwrap().join(if cfg!(windows) {
-        "rlox-lsp.exe"
-    } else {
-        "rlox-lsp"
-    });
 
+    #[cfg(windows)]
     assert_eq!(
-        resolve_sibling_lsp_from(&executable, |_| Ok(true)),
-        Ok(expected)
+        resolve_language_command_from(&executable, |_| {
+            panic!("Windows must not probe the blocked sibling LSP executable")
+        })
+        .map(|command| (command.executable, command.arguments)),
+        Ok((
+            executable.clone(),
+            vec![OsString::from(crate::LANGUAGE_WORKER_ARGUMENT)],
+        ))
     );
+
+    #[cfg(not(windows))]
     assert_eq!(
-        resolve_sibling_lsp_from(&executable, |_| Ok(false)),
+        resolve_language_command_from(&executable, |_| Ok(true))
+            .map(|command| (command.executable, command.arguments)),
+        Ok((executable.parent().unwrap().join("rlox-lsp"), Vec::new()))
+    );
+
+    #[cfg(not(windows))]
+    assert_eq!(
+        resolve_language_command_from(&executable, |_| Ok(false)),
         Err(SiblingResolutionError::Missing)
     );
+
+    #[cfg(not(windows))]
     assert_eq!(
-        resolve_sibling_lsp_from(PathBuf::from("relative/oxide-ide").as_path(), |_| Ok(true)),
+        resolve_language_command_from(&executable, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }),
+        Err(SiblingResolutionError::Metadata(
+            std::io::ErrorKind::PermissionDenied
+        ))
+    );
+
+    assert_eq!(
+        resolve_language_command_from(PathBuf::from("relative/oxide-ide").as_path(), |_| {
+            Ok(true)
+        }),
         Err(SiblingResolutionError::InvalidCurrentExecutable)
     );
 }

@@ -612,12 +612,12 @@ impl LanguageProcessConfig {
     pub(crate) fn sibling() -> Result<Self, SiblingResolutionError> {
         let current = std::env::current_exe()
             .map_err(|error| SiblingResolutionError::Metadata(error.kind()))?;
-        let executable = resolve_sibling_lsp_from(&current, |candidate| {
+        let command = resolve_language_command_from(&current, |candidate| {
             std::fs::metadata(candidate).map(|metadata| metadata.is_file())
         })?;
         Ok(Self {
-            executable,
-            arguments: Vec::new(),
+            executable: command.executable,
+            arguments: command.arguments,
             process_tick: PROCESS_TICK,
             cleanup_timeout: CLEANUP_TIMEOUT,
             #[cfg(test)]
@@ -2377,6 +2377,40 @@ pub(crate) enum SiblingResolutionError {
     Metadata(io::ErrorKind),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LanguageProcessCommand {
+    pub(crate) executable: PathBuf,
+    pub(crate) arguments: Vec<OsString>,
+}
+
+pub(crate) fn resolve_language_command_from(
+    current_executable: &Path,
+    is_file: impl FnOnce(&Path) -> io::Result<bool>,
+) -> Result<LanguageProcessCommand, SiblingResolutionError> {
+    if !current_executable.is_absolute() {
+        return Err(SiblingResolutionError::InvalidCurrentExecutable);
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = is_file;
+        Ok(LanguageProcessCommand {
+            executable: current_executable.to_path_buf(),
+            arguments: vec![OsString::from(crate::LANGUAGE_WORKER_ARGUMENT)],
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        let executable = resolve_sibling_lsp_from(current_executable, is_file)?;
+        Ok(LanguageProcessCommand {
+            executable,
+            arguments: Vec::new(),
+        })
+    }
+}
+
+#[cfg(not(windows))]
 pub(crate) fn resolve_sibling_lsp_from(
     current_executable: &Path,
     is_file: impl FnOnce(&Path) -> io::Result<bool>,
@@ -2388,11 +2422,7 @@ pub(crate) fn resolve_sibling_lsp_from(
         .parent()
         .filter(|parent| parent.is_absolute())
         .ok_or(SiblingResolutionError::InvalidCurrentExecutable)?;
-    let candidate = parent.join(if cfg!(windows) {
-        "rlox-lsp.exe"
-    } else {
-        "rlox-lsp"
-    });
+    let candidate = parent.join("rlox-lsp");
     match is_file(&candidate) {
         Ok(true) => Ok(candidate),
         Ok(false) => Err(SiblingResolutionError::Missing),
