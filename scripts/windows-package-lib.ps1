@@ -19,7 +19,7 @@ function Get-OxideBackendPin {
         $Manifest,
         '(?ms)^\[dependencies\][ \t]*\r?\n(?<body>.*?)(?=^\[|\z)'
     )
-    $AssignmentPattern = '(?ms)^[ \t]*rlox-protocol[ \t]*=[ \t]*\{(?<body>.*?)\}[ \t]*(?:#[^\r\n]*)?$'
+    $AssignmentPattern = '(?ms)^[ \t]*rlox-protocol[ \t]*=[ \t]*\{(?<body>.*?)\}[ \t]*(?:#[^\r\n]*)?\r?$'
     $AllAssignments = [regex]::Matches($Manifest, $AssignmentPattern)
     $Assignments = @()
     if ($DependencyTables.Count -eq 1) {
@@ -105,7 +105,7 @@ function Get-OxidePackageVersion {
     }
     $VersionMatch = [regex]::Match(
         $PackageMatch.Groups['body'].Value,
-        '(?m)^[ \t]*version[ \t]*=[ \t]*"(?<version>[^"\r\n]+)"[ \t]*(?:#[^\r\n]*)?$'
+        '(?m)^[ \t]*version[ \t]*=[ \t]*"(?<version>[^"\r\n]+)"[ \t]*(?:#[^\r\n]*)?\r?$'
     )
     if (-not $VersionMatch.Success) {
         throw "Standalone Cargo.toml is missing package.version."
@@ -141,7 +141,7 @@ function Assert-OxideLockProvenance {
         foreach ($Block in $Blocks) {
             $Name = [regex]::Match(
                 $Block.Groups['body'].Value,
-                '(?m)^[ \t]*name[ \t]*=[ \t]*"(?<value>[^"\r\n]+)"[ \t]*$'
+                '(?m)^[ \t]*name[ \t]*=[ \t]*"(?<value>[^"\r\n]+)"[ \t]*\r?$'
             )
             if ($Name.Success -and $Name.Groups['value'].Value -eq 'rlox-protocol') {
                 $Block.Groups['body'].Value
@@ -154,11 +154,11 @@ function Assert-OxideLockProvenance {
 
     $Version = [regex]::Match(
         $ProtocolBlocks[0],
-        '(?m)^[ \t]*version[ \t]*=[ \t]*"(?<value>[^"\r\n]+)"[ \t]*$'
+        '(?m)^[ \t]*version[ \t]*=[ \t]*"(?<value>[^"\r\n]+)"[ \t]*\r?$'
     )
     $Source = [regex]::Match(
         $ProtocolBlocks[0],
-        '(?m)^[ \t]*source[ \t]*=[ \t]*"(?<value>[^"\r\n]+)"[ \t]*$'
+        '(?m)^[ \t]*source[ \t]*=[ \t]*"(?<value>[^"\r\n]+)"[ \t]*\r?$'
     )
     $ExpectedSource = "git+$($Pin.Repository)?rev=$($Pin.Revision)#$($Pin.Revision)"
     if (-not $Version.Success -or $Version.Groups['value'].Value -ne $Pin.Version) {
@@ -308,7 +308,7 @@ function Assert-OxideBackendCheckout {
     )
     $ProtocolVersion = [regex]::Match(
         $ProtocolPackage.Groups['body'].Value,
-        '(?m)^[ \t]*version[ \t]*=[ \t]*"(?<value>[^"\r\n]+)"[ \t]*$'
+        '(?m)^[ \t]*version[ \t]*=[ \t]*"(?<value>[^"\r\n]+)"[ \t]*\r?$'
     )
     if (-not $ProtocolPackage.Success -or -not $ProtocolVersion.Success -or
         $ProtocolVersion.Groups['value'].Value -ne $Pin.Version) {

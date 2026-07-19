@@ -90,13 +90,29 @@ version = "1.2.3-beta.1"
 [dependencies]
 rlox-protocol = { version = "=0.1.0", rev = "__REV__", git = "https://github.com/fonzy1243/RLox.git" }
 '@.Replace('__REV__', $Revision)
-    Set-Content -LiteralPath $ManifestPath -Value $PinnedManifest -Encoding utf8NoBOM -NoNewline
+    $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    $LfManifest = $PinnedManifest.Replace("`r`n", "`n") + "`n"
+    [System.IO.File]::WriteAllText($ManifestPath, $LfManifest, $Utf8NoBom)
 
     $Pin = Get-OxideBackendPin -ManifestPath $ManifestPath
     Assert-Equal $Revision $Pin.Revision 'the full backend revision is parsed exactly'
     Assert-Equal 'https://github.com/fonzy1243/RLox.git' $Pin.Repository 'the canonical repository is required'
     Assert-Equal '0.1.0' $Pin.Version 'the protocol version is exact'
     Assert-Equal '1.2.3-beta.1' (Get-OxidePackageVersion -ManifestPath $ManifestPath) 'the package version is read from [package]'
+
+    $CrLfManifest = $LfManifest.Replace("`n", "`r`n")
+    [System.IO.File]::WriteAllText($ManifestPath, $CrLfManifest, $Utf8NoBom)
+    $CrLfPin = Get-OxideBackendPin -ManifestPath $ManifestPath
+    Assert-Equal $Revision $CrLfPin.Revision 'the full backend revision is parsed exactly from CRLF'
+    Assert-Equal `
+        'https://github.com/fonzy1243/RLox.git' `
+        $CrLfPin.Repository `
+        'the canonical repository is required in CRLF'
+    Assert-Equal '0.1.0' $CrLfPin.Version 'the protocol version is exact in CRLF'
+    Assert-Equal `
+        '1.2.3-beta.1' `
+        (Get-OxidePackageVersion -ManifestPath $ManifestPath) `
+        'the package version is read from a CRLF [package] table'
 
     $PathManifest = $PinnedManifest.Replace(
         'rlox-protocol = { version = "=0.1.0", rev = "' + $Revision + '", git = "https://github.com/fonzy1243/RLox.git" }',
@@ -129,7 +145,7 @@ rlox-protocol = { version = "=0.1.0", rev = "__REV__", git = "https://github.com
     } '*invalid rlox-protocol pin*' 'mixed Git and path provenance is rejected'
 
     Set-Content -LiteralPath $ManifestPath -Value $PinnedManifest -Encoding utf8NoBOM -NoNewline
-    $Lock = @'
+    $LfLock = @'
 version = 4
 
 [[package]]
@@ -141,12 +157,18 @@ name = "rlox-protocol"
 version = "0.1.0"
 source = "git+https://github.com/fonzy1243/RLox.git?rev=__REV__#__REV__"
 '@.Replace('__REV__', $Revision)
-    Set-Content -LiteralPath $LockPath -Value $Lock -Encoding utf8NoBOM -NoNewline
+    $LfLock = $LfLock.Replace("`r`n", "`n") + "`n"
+    [System.IO.File]::WriteAllText($LockPath, $LfLock, $Utf8NoBom)
     Assert-OxideLockProvenance -LockPath $LockPath -Pin $Pin
-    Assert-True $true 'an exact Cargo.lock source is accepted'
+    Assert-True $true 'an exact LF Cargo.lock source is accepted'
 
-    $WrongLock = $Lock.Replace("#$Revision", '#ffffffffffffffffffffffffffffffffffffffff')
-    Set-Content -LiteralPath $LockPath -Value $WrongLock -Encoding utf8NoBOM -NoNewline
+    $CrLfLock = $LfLock.Replace("`n", "`r`n")
+    [System.IO.File]::WriteAllText($LockPath, $CrLfLock, $Utf8NoBom)
+    Assert-OxideLockProvenance -LockPath $LockPath -Pin $Pin
+    Assert-True $true 'an exact CRLF Cargo.lock source is accepted'
+
+    $WrongLock = $CrLfLock.Replace("#$Revision", '#ffffffffffffffffffffffffffffffffffffffff')
+    [System.IO.File]::WriteAllText($LockPath, $WrongLock, $Utf8NoBom)
     Assert-ThrowsLike {
         Assert-OxideLockProvenance -LockPath $LockPath -Pin $Pin
     } '*source must be exactly*' 'a mismatched lockfile commit is rejected'
@@ -197,11 +219,18 @@ source = "git+https://github.com/fonzy1243/RLox.git?rev=__REV__#__REV__"
 name = "rlox"
 version = "0.1.0"
 '@ -Encoding utf8NoBOM -NoNewline
-    Set-Content -LiteralPath (Join-Path $BackendDirectory 'crates/rlox-protocol/Cargo.toml') -Value @'
+    $ProtocolManifest = @'
 [package]
 name = "rlox-protocol"
 version = "0.1.0"
-'@ -Encoding utf8NoBOM -NoNewline
+'@
+    $LfProtocolManifest = $ProtocolManifest.Replace("`r`n", "`n") + "`n"
+    $CrLfProtocolManifest = $LfProtocolManifest.Replace("`n", "`r`n")
+    [System.IO.File]::WriteAllText(
+        (Join-Path $BackendDirectory 'crates/rlox-protocol/Cargo.toml'),
+        $CrLfProtocolManifest,
+        $Utf8NoBom
+    )
     Set-Content -LiteralPath (Join-Path $BackendDirectory 'LICENSE') -Value 'license' -Encoding ascii -NoNewline
     Set-Content `
         -LiteralPath (Join-Path $BackendDirectory '.gitignore') `
@@ -417,18 +446,18 @@ version = "0.1.0"
     Copy-Item `
         -LiteralPath (Join-Path $PSScriptRoot 'windows-package-lib.ps1') `
         -Destination $StandaloneScripts
-    $StandaloneManifest = $PinnedManifest.Replace($Revision, $BackendRevision)
-    $StandaloneLock = $Lock.Replace($Revision, $BackendRevision)
-    Set-Content `
-        -LiteralPath (Join-Path $StandaloneRoot 'Cargo.toml') `
-        -Value $StandaloneManifest `
-        -Encoding utf8NoBOM `
-        -NoNewline
-    Set-Content `
-        -LiteralPath (Join-Path $StandaloneRoot 'Cargo.lock') `
-        -Value $StandaloneLock `
-        -Encoding utf8NoBOM `
-        -NoNewline
+    $StandaloneManifest = $CrLfManifest.Replace($Revision, $BackendRevision)
+    $StandaloneLock = $CrLfLock.Replace($Revision, $BackendRevision)
+    [System.IO.File]::WriteAllText(
+        (Join-Path $StandaloneRoot 'Cargo.toml'),
+        $StandaloneManifest,
+        $Utf8NoBom
+    )
+    [System.IO.File]::WriteAllText(
+        (Join-Path $StandaloneRoot 'Cargo.lock'),
+        $StandaloneLock,
+        $Utf8NoBom
+    )
     Set-Content `
         -LiteralPath (Join-Path $StandaloneRoot 'LICENSE') `
         -Value 'oxide license' `
