@@ -816,11 +816,110 @@ mod language_worker_process {
     use lsp_server::Message;
     use oxide_ide::LANGUAGE_WORKER_ARGUMENT;
     use std::{
-        io::{BufReader, Cursor, Write},
+        io::{self, BufReader, Cursor, Write},
         process::{Child, Command, Output, Stdio},
         thread,
         time::{Duration, Instant},
     };
+
+    const MAIN_EXIT_DEADLINE: Duration = Duration::from_secs(5);
+    const CLEANUP_DEADLINE: Duration = Duration::from_millis(500);
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    struct ChildOwner {
+        child: Option<Child>,
+    }
+
+    impl ChildOwner {
+        fn new(child: Child) -> Self {
+            Self { child: Some(child) }
+        }
+
+        fn child_mut(&mut self) -> &mut Child {
+            self.child.as_mut().expect("child owner is populated")
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+            self.child_mut().try_wait()
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.child_mut().kill()
+        }
+
+        fn exited_output(mut self) -> io::Result<Output> {
+            self.child
+                .take()
+                .expect("exited child is still owned")
+                .wait_with_output()
+        }
+    }
+
+    impl Drop for ChildOwner {
+        fn drop(&mut self) {
+            let Some(child) = self.child.as_mut() else {
+                return;
+            };
+            if let Err(error) = bounded_child_cleanup(child) {
+                eprintln!("language worker test cleanup failed: {error}");
+            }
+        }
+    }
+
+    fn bounded_child_cleanup(child: &mut Child) -> Result<(), String> {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait()
+                    .map(|_| ())
+                    .map_err(|error| format!("could not reap exited child: {error}"));
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("language worker cleanup status check failed: {error}"),
+        }
+
+        let kill_error = child.kill().err();
+        let deadline = Instant::now() + CLEANUP_DEADLINE;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    let reap_error = child.wait().err();
+                    return match (kill_error, reap_error) {
+                        (None, None) => Ok(()),
+                        (Some(kill_error), None) => Err(format!(
+                            "kill failed: {kill_error}; child exited during bounded cleanup"
+                        )),
+                        (None, Some(reap_error)) => {
+                            Err(format!("could not reap killed child: {reap_error}"))
+                        }
+                        (Some(kill_error), Some(reap_error)) => Err(format!(
+                            "kill failed: {kill_error}; could not reap exited child: {reap_error}"
+                        )),
+                    };
+                }
+                Ok(None) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
+                Ok(None) => {
+                    return Err(match kill_error {
+                        Some(error) => format!(
+                            "kill failed: {error}; child still running after bounded cleanup"
+                        ),
+                        None => {
+                            "child still running after successful kill request and bounded cleanup"
+                                .to_owned()
+                        }
+                    });
+                }
+                Err(status_error) => {
+                    return Err(match kill_error {
+                        Some(kill_error) => format!(
+                            "kill failed: {kill_error}; cleanup status check failed: {status_error}"
+                        ),
+                        None => format!("cleanup status check failed: {status_error}"),
+                    });
+                }
+            }
+        }
+    }
 
     fn frame(value: serde_json::Value) -> Vec<u8> {
         let body = serde_json::to_vec(&value).expect("request is serializable");
@@ -829,22 +928,46 @@ mod language_worker_process {
         framed
     }
 
-    fn wait_for_child(mut child: Child) -> Output {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    fn wait_for_child(mut child: ChildOwner) -> Output {
+        let deadline = Instant::now() + MAIN_EXIT_DEADLINE;
         loop {
             match child.try_wait().expect("child status is readable") {
-                Some(_) => return child.wait_with_output().expect("child output is readable"),
-                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Some(_) => {
+                    return child
+                        .exited_output()
+                        .expect("exited child output is readable");
+                }
+                None if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
                 None => {
-                    let _ = child.kill();
-                    let output = child
-                        .wait_with_output()
-                        .expect("timed-out child output is readable");
-                    panic!(
-                        "language worker did not exit within five seconds; stdout: {}; stderr: {}",
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    );
+                    let kill_result = child.kill();
+                    let kill_report = match &kill_result {
+                        Ok(()) => "kill request succeeded".to_owned(),
+                        Err(error) => format!("kill request failed: {error}"),
+                    };
+                    let cleanup_deadline = Instant::now() + CLEANUP_DEADLINE;
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => {
+                                let output = child
+                                    .exited_output()
+                                    .expect("exited timed-out child output is readable");
+                                panic!(
+                                    "language worker did not exit within five seconds; {kill_report}; stdout: {}; stderr: {}",
+                                    String::from_utf8_lossy(&output.stdout),
+                                    String::from_utf8_lossy(&output.stderr)
+                                );
+                            }
+                            Ok(None) if Instant::now() < cleanup_deadline => {
+                                thread::sleep(POLL_INTERVAL);
+                            }
+                            Ok(None) => panic!(
+                                "language worker did not exit within five seconds; {kill_report}; child remained running after bounded cleanup"
+                            ),
+                            Err(status_error) => panic!(
+                                "language worker did not exit within five seconds; {kill_report}; cleanup status check failed: {status_error}"
+                            ),
+                        }
+                    }
                 }
             }
         }
@@ -972,14 +1095,20 @@ mod language_worker_process {
         .flat_map(frame)
         .collect::<Vec<_>>();
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_oxide-ide"))
-            .arg(LANGUAGE_WORKER_ARGUMENT)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("language worker starts");
-        let mut stdin = child.stdin.take().expect("language worker stdin");
+        let mut child = ChildOwner::new(
+            Command::new(env!("CARGO_BIN_EXE_oxide-ide"))
+                .arg(LANGUAGE_WORKER_ARGUMENT)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("language worker starts"),
+        );
+        let mut stdin = child
+            .child_mut()
+            .stdin
+            .take()
+            .expect("language worker stdin");
         stdin.write_all(&input).expect("write language session");
         drop(stdin);
 
