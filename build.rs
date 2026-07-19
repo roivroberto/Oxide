@@ -2,7 +2,7 @@ fn main() {
     println!("cargo:rerun-if-changed=windows");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        embed_resource::compile(
+        embed_resource::compile_for_everything(
             "windows/oxide-ide.rc",
             embed_resource::ParamsIncludeDirs(["windows"]),
         )
