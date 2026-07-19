@@ -467,7 +467,7 @@ impl PartialContainedChild {
         Ok(Self::Unassigned { child, job })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn root_id(&self) -> u32 {
         match self {
             Self::Unassigned { child, .. } => child.id(),
@@ -1127,18 +1127,19 @@ mod platform {
 mod tests {
     #[cfg(unix)]
     use std::io::{Read, Write};
+    #[cfg(unix)]
     use std::process::Command;
     #[cfg(unix)]
-    use std::time::Duration;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
-    use super::{
-        ContainedChild, DebuggerCleanup, LaunchOps, PartialCleanupOps, ProcessOps,
-        cleanup_for_debugger, effective_spawn_error,
-    };
     #[cfg(unix)]
-    use super::{ContainedPipedChild, ContainedSpawnAttempt, PartialContainedChild};
+    use super::{
+        ContainedChild, ContainedPipedChild, ContainedSpawnAttempt, LaunchOps, PartialCleanupOps,
+        PartialContainedChild, ProcessOps,
+    };
+    use super::{DebuggerCleanup, cleanup_for_debugger, effective_spawn_error};
 
+    #[cfg(unix)]
     #[derive(Default)]
     struct FaultLaunchOps {
         assign_error: Option<std::io::ErrorKind>,
@@ -1148,6 +1149,7 @@ mod tests {
         resumed: usize,
     }
 
+    #[cfg(unix)]
     impl LaunchOps for FaultLaunchOps {
         fn create_job(&mut self) -> std::io::Result<super::platform::ProcessJob> {
             super::platform::ProcessJob::create()
@@ -1208,6 +1210,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[derive(Default)]
     struct FaultProcessOps {
         terminations: usize,
@@ -1217,6 +1220,7 @@ mod tests {
         reap_status: Option<std::process::ExitStatus>,
     }
 
+    #[cfg(unix)]
     impl ProcessOps for FaultProcessOps {
         fn try_wait_root(
             &mut self,
@@ -1258,6 +1262,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[derive(Default)]
     struct CountingPartialCleanup {
         terminations: usize,
@@ -1266,6 +1271,7 @@ mod tests {
         reap_error: Option<std::io::ErrorKind>,
     }
 
+    #[cfg(unix)]
     impl PartialCleanupOps for CountingPartialCleanup {
         fn terminate_unassigned(&mut self, child: &mut std::process::Child) -> std::io::Result<()> {
             self.terminations += 1;
