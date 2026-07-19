@@ -447,71 +447,220 @@ fn move_new_file(temporary: &Path, target: &Path) -> io::Result<()> {
 fn replace_existing_file(temporary: &Path, target: &Path) -> io::Result<()> {
     use std::ptr;
 
-    use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2;
     use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
     let parent = target
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
-    let mut backup = reserve_sibling_backup(parent)?;
+    let mut stage = create_sibling_hard_link_stage(parent, target)?;
+    let (backup_path, backup_file) = reserve_sibling_replace_backup(parent)?;
+    drop(backup_file);
+    let mut backup = PendingTemp::new(backup_path);
+    let stage_wide = windows_path_utf16(stage.path())?;
     let temporary_wide = windows_path_utf16(temporary)?;
-    let target_wide = windows_path_utf16(target)?;
     let backup_wide = windows_path_utf16(backup.path())?;
-    // No ignore flags are used: failing to merge attributes or ACLs must fail
-    // the save instead of silently weakening the destination metadata.
-    // SAFETY: all paths are live, NUL-terminated UTF-16 buffers. The reserved
-    // pointer parameters are null as required by ReplaceFileW.
+    // Merge the destination metadata into the completed temporary file while
+    // the public target name still refers to the old file. No ignore flags are
+    // used: failing to merge attributes, streams, or ACLs must fail the save.
+    // The owned backup name makes every documented partial-failure location
+    // known so cleanup cannot strand an unspecified old-content hard link.
+    // SAFETY: all paths are live, NUL-terminated UTF-16 buffers, and the
+    // reserved pointer parameters are null.
     if unsafe {
         ReplaceFileW(
-            target_wide.as_ptr(),
+            stage_wide.as_ptr(),
             temporary_wide.as_ptr(),
             backup_wide.as_ptr(),
             0,
             ptr::null(),
             ptr::null(),
         )
-    } != 0
+    } == 0
     {
-        backup.remove()?;
-        return Ok(());
+        return Err(io::Error::last_os_error());
     }
 
-    let error = io::Error::last_os_error();
-    // In this failure mode Windows has moved the original to the requested
-    // backup name but has not installed the replacement. Restore without
-    // overwriting a destination that may have appeared concurrently. If the
-    // restoration itself fails, the recovery file is deliberately retained.
-    if error.raw_os_error() == Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 as i32) {
-        match fs::symlink_metadata(target) {
-            Err(target_error) if target_error.kind() == io::ErrorKind::NotFound => {
-                let _ = move_new_file(backup.path(), target);
-            }
-            _ => {}
-        }
-    }
-    Err(error)
+    backup.remove()?;
+    publish_replacement_stage(stage.path(), target)?;
+    stage.committed = true;
+    Ok(())
 }
 
 #[cfg(windows)]
-fn reserve_sibling_backup(parent: &Path) -> io::Result<PendingBackup> {
+fn reserve_sibling_replace_backup(parent: &Path) -> io::Result<(PathBuf, File)> {
     for _ in 0..TEMP_ATTEMPTS {
         let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
         let path = parent.join(format!(
-            ".oxide-recovery-{}-{sequence}.bak",
+            ".oxide-save-{}-{sequence}.backup",
             std::process::id()
         ));
-        match fs::symlink_metadata(&path) {
-            Ok(_) => continue,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(PendingBackup::new(path));
-            }
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        "could not allocate a unique recovery file",
+        "could not allocate a unique replacement backup",
     ))
+}
+
+#[cfg(windows)]
+fn create_sibling_hard_link_stage(parent: &Path, target: &Path) -> io::Result<PendingTemp> {
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+    use windows_sys::Win32::Storage::FileSystem::CreateHardLinkW;
+
+    // A volume without hard-link support fails here before either the public
+    // target or completed temporary file is changed. Falling back to a direct
+    // ReplaceFileW would reintroduce the public-name gap this stage prevents.
+    let target_wide = windows_path_utf16(target)?;
+    for _ in 0..TEMP_ATTEMPTS {
+        let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".oxide-save-{}-{sequence}.stage",
+            std::process::id()
+        ));
+        let path_wide = windows_path_utf16(&path)?;
+        // SAFETY: both paths are live, NUL-terminated UTF-16 buffers, and the
+        // reserved security-attributes parameter is null as required.
+        if unsafe { CreateHardLinkW(path_wide.as_ptr(), target_wide.as_ptr(), ptr::null()) } != 0 {
+            return Ok(PendingTemp::new(path));
+        }
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_ALREADY_EXISTS as i32 || code == ERROR_FILE_EXISTS as i32
+        ) {
+            continue;
+        }
+        return Err(error);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique replacement stage",
+    ))
+}
+
+#[cfg(windows)]
+fn publish_replacement_stage(stage: &Path, target: &Path) -> io::Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileRenameInfoEx, SetFileInformationByHandle,
+    };
+
+    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
+    const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
+
+    let target_name = windows_rename_target_utf16(target)?;
+    let file_name_bytes = (target_name.len() - 1)
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "save path is too long"))?;
+    let file_name_length = u32::try_from(file_name_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "save path is too long"))?;
+    let buffer_bytes = windows_rename_info_buffer_bytes(file_name_bytes)?;
+    let buffer_size = u32::try_from(buffer_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "save path is too long"))?;
+    let mut buffer = vec![0_usize; buffer_bytes.div_ceil(size_of::<usize>())];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: the usize-backed buffer is suitably aligned and large enough for
+    // the fixed header plus the full target path and its trailing NUL.
+    unsafe {
+        (*info).Anonymous.Flags =
+            FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+        (*info).RootDirectory = ptr::null_mut();
+        (*info).FileNameLength = file_name_length;
+        ptr::copy_nonoverlapping(
+            target_name.as_ptr(),
+            (*info).FileName.as_mut_ptr(),
+            target_name.len(),
+        );
+    }
+
+    let stage_file = OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(stage)?;
+    // SAFETY: stage_file owns a valid handle with DELETE access, and info
+    // points to a live FILE_RENAME_INFO buffer of buffer_size bytes.
+    if unsafe {
+        SetFileInformationByHandle(
+            stage_file.as_raw_handle(),
+            FileRenameInfoEx,
+            info.cast(),
+            buffer_size,
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn windows_rename_info_buffer_bytes(file_name_bytes: usize) -> io::Result<usize> {
+    use std::mem::size_of;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+
+    size_of::<FILE_RENAME_INFO>()
+        .checked_add(file_name_bytes)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "save path is too long"))
+}
+
+#[cfg(windows)]
+fn windows_rename_target_utf16(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const BACKSLASH: u16 = b'\\' as u16;
+    const VERBATIM_PREFIX: [u16; 4] = [BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH];
+
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows rename target is not absolute",
+        ));
+    }
+    let encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if encoded.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path contains a NUL character",
+        ));
+    }
+
+    let is_verbatim_unc = encoded.starts_with(&VERBATIM_PREFIX)
+        && encoded.len() >= 8
+        && matches!(encoded[4], value if value == b'U' as u16 || value == b'u' as u16)
+        && matches!(encoded[5], value if value == b'N' as u16 || value == b'n' as u16)
+        && matches!(encoded[6], value if value == b'C' as u16 || value == b'c' as u16)
+        && encoded[7] == BACKSLASH;
+    let is_verbatim_drive = encoded.starts_with(&VERBATIM_PREFIX)
+        && encoded.len() >= 7
+        && matches!(encoded[4], value if (b'A' as u16..=b'Z' as u16).contains(&value) || (b'a' as u16..=b'z' as u16).contains(&value))
+        && encoded[5] == b':' as u16
+        && encoded[6] == BACKSLASH;
+    let mut normalized = if is_verbatim_unc {
+        let mut normalized = Vec::with_capacity(encoded.len() - 6);
+        normalized.extend_from_slice(&[BACKSLASH, BACKSLASH]);
+        normalized.extend_from_slice(&encoded[8..]);
+        normalized
+    } else if is_verbatim_drive {
+        encoded[4..].to_vec()
+    } else {
+        encoded
+    };
+    normalized.push(0);
+    Ok(normalized)
 }
 
 #[cfg(windows)]
@@ -551,66 +700,26 @@ impl PendingTemp {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    #[cfg(windows)]
+    fn remove(&mut self) -> io::Result<()> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => {
+                self.committed = true;
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.committed = true;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl Drop for PendingTemp {
     fn drop(&mut self) {
         if !self.committed {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-#[cfg(windows)]
-struct PendingBackup {
-    path: PathBuf,
-    remove_on_drop: bool,
-}
-
-#[cfg(any(windows, test))]
-fn remove_recovery_file_with(
-    path: &Path,
-    mut remove: impl FnMut(&Path) -> io::Result<()>,
-) -> io::Result<()> {
-    match remove(path) {
-        Ok(()) => return Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => {}
-    }
-    match remove(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(windows)]
-impl PendingBackup {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            remove_on_drop: false,
-        }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn remove(&mut self) -> io::Result<()> {
-        self.remove_on_drop = true;
-        let result = remove_recovery_file_with(&self.path, |path| fs::remove_file(path));
-        if result.is_ok() {
-            self.remove_on_drop = false;
-        }
-        result
-    }
-}
-
-#[cfg(windows)]
-impl Drop for PendingBackup {
-    fn drop(&mut self) {
-        if self.remove_on_drop {
             let _ = fs::remove_file(&self.path);
         }
     }
@@ -626,43 +735,26 @@ fn classify_io_error(error: &io::Error) -> FileFailureKind {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
-    use std::cell::Cell;
+    use std::mem::{offset_of, size_of};
 
-    use super::*;
+    use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
 
-    #[test]
-    fn committed_recovery_cleanup_retries_once() {
-        let attempts = Cell::new(0);
-
-        remove_recovery_file_with(Path::new("recovery.bak"), |_| {
-            let attempt = attempts.get() + 1;
-            attempts.set(attempt);
-            if attempt == 1 {
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "recovery file is still in use",
-                ))
-            } else {
-                Ok(())
-            }
-        })
-        .expect("a transient cleanup failure should be retried");
-
-        assert_eq!(attempts.get(), 2);
-    }
+    use super::windows_rename_info_buffer_bytes;
 
     #[test]
-    fn committed_recovery_cleanup_failure_is_reported() {
-        let failure = remove_recovery_file_with(Path::new("recovery.bak"), |_| {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "recovery file is still in use",
-            ))
-        })
-        .expect_err("cleanup failure must remain visible");
+    fn rename_information_buffer_meets_the_documented_minimum() {
+        let file_name_bytes = 42;
+        let buffer_bytes = windows_rename_info_buffer_bytes(file_name_bytes).unwrap();
 
-        assert_eq!(failure.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            buffer_bytes,
+            size_of::<FILE_RENAME_INFO>() + file_name_bytes
+        );
+        assert!(
+            buffer_bytes
+                >= offset_of!(FILE_RENAME_INFO, FileName) + file_name_bytes + size_of::<u16>()
+        );
     }
 }

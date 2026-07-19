@@ -5,6 +5,11 @@ use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(windows)]
+use std::fs::File;
+#[cfg(windows)]
+use std::io::Read;
+
 use oxide_ide::file_dialog::{
     FileExecutor, FileJob, FileSubmitError, SOURCE_EXTENSION, SaveDialogHint,
     map_open_dialog_result, map_save_dialog_result, map_unsaved_dialog_outcome,
@@ -163,6 +168,23 @@ fn atomic_write_replaces_an_existing_file_without_exposing_partial_bytes() {
     fs::write(&target, b"old contents").unwrap();
 
     assert_eq!(write_file_atomically(&target, b"new contents\n"), Ok(()));
+    assert_eq!(fs::read(&target).unwrap(), b"new contents\n");
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn atomic_write_keeps_old_handle_readable_while_fresh_opens_see_replacement() {
+    let directory = TempDir::new();
+    let target = directory.path().join("open-handle.ox");
+    fs::write(&target, b"old contents").unwrap();
+    let mut old_handle = File::open(&target).unwrap();
+
+    assert_eq!(write_file_atomically(&target, b"new contents\n"), Ok(()));
+
+    let mut old_contents = Vec::new();
+    old_handle.read_to_end(&mut old_contents).unwrap();
+    assert_eq!(old_contents, b"old contents");
     assert_eq!(fs::read(&target).unwrap(), b"new contents\n");
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
 }
