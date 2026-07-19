@@ -812,6 +812,216 @@ fn new_input_request_reveals_output_and_focuses_the_input_field() {
     assert!(screen.contains(input.rect().min) && screen.contains(input.rect().max));
 }
 
+mod language_worker_process {
+    use lsp_server::Message;
+    use oxide_ide::LANGUAGE_WORKER_ARGUMENT;
+    use std::{
+        io::{BufReader, Cursor, Write},
+        process::{Child, Command, Output, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    fn frame(value: serde_json::Value) -> Vec<u8> {
+        let body = serde_json::to_vec(&value).expect("request is serializable");
+        let mut framed = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        framed.extend_from_slice(&body);
+        framed
+    }
+
+    fn wait_for_child(mut child: Child) -> Output {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait().expect("child status is readable") {
+                Some(_) => return child.wait_with_output().expect("child output is readable"),
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                None => {
+                    let _ = child.kill();
+                    let output = child
+                        .wait_with_output()
+                        .expect("timed-out child output is readable");
+                    panic!(
+                        "language worker did not exit within five seconds; stdout: {}; stderr: {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        }
+    }
+
+    fn parse_stdout(stdout: Vec<u8>) -> Vec<serde_json::Value> {
+        let mut reader = BufReader::new(Cursor::new(stdout));
+        let mut messages = Vec::new();
+        while let Some(message) =
+            Message::read(&mut reader).expect("stdout contains only framed LSP messages")
+        {
+            messages.push(serde_json::to_value(message).expect("LSP message is serializable"));
+        }
+        messages
+    }
+
+    fn published_diagnostics(messages: &[serde_json::Value], version: i64) -> &serde_json::Value {
+        messages
+            .iter()
+            .find(|message| {
+                message["method"] == "textDocument/publishDiagnostics"
+                    && message["params"]["version"] == version
+            })
+            .unwrap_or_else(|| panic!("missing diagnostics for version {version}: {messages:#?}"))
+    }
+
+    fn assert_error(
+        messages: &[serde_json::Value],
+        version: i64,
+        code: &str,
+        phase: &str,
+        start: (u64, u64),
+        end: (u64, u64),
+    ) {
+        let published = published_diagnostics(messages, version);
+        let diagnostic = published["params"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics is an array")
+            .iter()
+            .find(|diagnostic| diagnostic["code"] == code)
+            .unwrap_or_else(|| panic!("missing {code}: {published:#?}"));
+        assert_eq!(diagnostic["severity"], 1);
+        assert_eq!(diagnostic["source"], "rlox");
+        assert_eq!(diagnostic["data"]["phase"], phase);
+        assert_eq!(diagnostic["range"]["start"]["line"], start.0);
+        assert_eq!(diagnostic["range"]["start"]["character"], start.1);
+        assert_eq!(diagnostic["range"]["end"]["line"], end.0);
+        assert_eq!(diagnostic["range"]["end"]["character"], end.1);
+    }
+
+    #[test]
+    fn language_worker_publishes_all_diagnostic_phases_and_clears_them() {
+        let uri = "file:///workspace/diagnostics.lox";
+        let input = [
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "capabilities": {
+                        "general": {"positionEncodings": ["utf-16"]},
+                        "textDocument": {
+                            "publishDiagnostics": {
+                                "versionSupport": true,
+                                "dataSupport": true
+                            }
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "initialized",
+                "params": {}
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "lox",
+                        "version": 1,
+                        "text": "\u{feff}\"😀\" @\r\n"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didChange",
+                "params": {
+                    "textDocument": {"uri": uri, "version": 2},
+                    "contentChanges": [{"text": "\u{feff}//😀\r\nvar = 1;"}]
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didChange",
+                "params": {
+                    "textDocument": {"uri": uri, "version": 3},
+                    "contentChanges": [{"text": "//😀\rreturn;"}]
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didChange",
+                "params": {
+                    "textDocument": {"uri": uri, "version": 4},
+                    "contentChanges": [{"text": "var greeting = \"😀\";\r\nprint greeting;"}]
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "shutdown",
+                "params": null
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "exit",
+                "params": null
+            }),
+        ]
+        .into_iter()
+        .flat_map(frame)
+        .collect::<Vec<_>>();
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_oxide-ide"))
+            .arg(LANGUAGE_WORKER_ARGUMENT)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("language worker starts");
+        let mut stdin = child.stdin.take().expect("language worker stdin");
+        stdin.write_all(&input).expect("write language session");
+        drop(stdin);
+
+        let output = wait_for_child(child);
+        assert!(
+            output.status.success(),
+            "language worker failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "unexpected stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let messages = parse_stdout(output.stdout);
+        assert_eq!(messages.len(), 6, "unexpected LSP output: {messages:#?}");
+        let initialize = &messages[0];
+        assert_eq!(initialize["id"], 1);
+        assert_eq!(
+            initialize["result"]["capabilities"]["positionEncoding"],
+            "utf-16"
+        );
+        for (message, version) in messages[1..=4].iter().zip(1..=4) {
+            assert_eq!(message["method"], "textDocument/publishDiagnostics");
+            assert_eq!(message["params"]["version"], version);
+        }
+        assert_error(&messages, 1, "scanner.error", "scanner", (0, 6), (0, 7));
+        assert_error(&messages, 2, "parser.error", "parser", (1, 4), (1, 5));
+        assert_error(&messages, 3, "compiler.error", "compiler", (1, 0), (1, 6));
+        assert!(
+            published_diagnostics(&messages, 4)["params"]["diagnostics"]
+                .as_array()
+                .expect("diagnostics is an array")
+                .is_empty()
+        );
+        let shutdown = &messages[5];
+        assert_eq!(shutdown["id"], 9);
+        assert_eq!(shutdown["result"], serde_json::Value::Null);
+    }
+}
+
 #[test]
 fn diagnostics_and_output_reveal_their_console_tabs() {
     let (model, run) = running_model(RunMode::Run);

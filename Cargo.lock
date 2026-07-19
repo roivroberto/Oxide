@@ -683,6 +683,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1715,6 +1724,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "lsp-server"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ee25a31f2e571e426eef2896179450cafc7e2f5be00d8a93b1c2d21c0ff7656"
+dependencies = [
+ "crossbeam-channel",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+]
+
+[[package]]
 name = "lsp-types"
 version = "0.97.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2217,8 +2239,10 @@ dependencies = [
  "eframe",
  "egui_kittest",
  "embed-resource",
+ "lsp-server",
  "lsp-types",
  "rfd",
+ "rlox-lsp",
  "rlox-protocol",
  "serde",
  "serde_json",
@@ -2595,6 +2619,27 @@ dependencies = [
  "wayland-protocols",
  "web-sys",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rlox"
+version = "0.1.0"
+source = "git+https://github.com/fonzy1243/RLox.git?rev=8c3fa74c4e9a36326e121df2e7ecd035202101a2#8c3fa74c4e9a36326e121df2e7ecd035202101a2"
+dependencies = [
+ "rlox-protocol",
+ "serde",
+]
+
+[[package]]
+name = "rlox-lsp"
+version = "0.1.0"
+source = "git+https://github.com/fonzy1243/RLox.git?rev=8c3fa74c4e9a36326e121df2e7ecd035202101a2#8c3fa74c4e9a36326e121df2e7ecd035202101a2"
+dependencies = [
+ "lsp-server",
+ "lsp-types",
+ "rlox",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

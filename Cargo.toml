@@ -11,7 +11,9 @@ embed-resource = "=3.0.11"
 [dependencies]
 arc-swap = "=1.9.2"
 eframe = { version = "=0.35.0", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+lsp-server = "=0.10.0"
 lsp-types = "=0.97.0"
+rlox-lsp = { git = "https://github.com/fonzy1243/RLox.git", rev = "8c3fa74c4e9a36326e121df2e7ecd035202101a2", version = "=0.1.0" }
 rlox-protocol = { git = "https://github.com/fonzy1243/RLox.git", rev = "8c3fa74c4e9a36326e121df2e7ecd035202101a2", version = "=0.1.0" }
 rfd = { version = "=0.17.2", features = ["common-controls-v6"] }
 serde = { version = "=1.0.228", features = ["derive", "rc"] }
