@@ -12,6 +12,9 @@ mod process;
 mod runtime;
 mod snapshot_view;
 
+#[doc(hidden)]
+pub const LANGUAGE_WORKER_ARGUMENT: &str = "--oxide-language-worker";
+
 pub use app::*;
 pub use editor::*;
 pub use model::*;

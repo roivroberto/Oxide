@@ -2,9 +2,24 @@
 
 use std::process::ExitCode;
 
-use oxide_ide::{APP_NAME, run_visible};
+use oxide_ide::{APP_NAME, LANGUAGE_WORKER_ARGUMENT, run_visible};
 
 const MAX_STARTUP_DETAIL_CHARS: usize = 2_048;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupMode {
+    Visible,
+    LanguageWorker,
+}
+
+fn startup_mode(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> StartupMode {
+    let arguments: Vec<_> = arguments.into_iter().collect();
+    if arguments.len() == 1 && arguments[0] == LANGUAGE_WORKER_ARGUMENT {
+        StartupMode::LanguageWorker
+    } else {
+        StartupMode::Visible
+    }
+}
 
 fn main() -> ExitCode {
     match run_visible() {
@@ -42,6 +57,39 @@ fn visible_startup_message(detail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn zero_arguments_select_visible_mode() {
+        assert_eq!(startup_mode(Vec::<OsString>::new()), StartupMode::Visible);
+    }
+
+    #[test]
+    fn exact_private_argument_selects_language_worker() {
+        assert_eq!(
+            startup_mode([OsString::from(LANGUAGE_WORKER_ARGUMENT)]),
+            StartupMode::LanguageWorker
+        );
+    }
+
+    #[test]
+    fn private_argument_with_extra_argument_selects_visible_mode() {
+        assert_eq!(
+            startup_mode([
+                OsString::from(LANGUAGE_WORKER_ARGUMENT),
+                OsString::from("extra"),
+            ]),
+            StartupMode::Visible
+        );
+    }
+
+    #[test]
+    fn unknown_argument_selects_visible_mode() {
+        assert_eq!(
+            startup_mode([OsString::from("--oxide-language-worker-extra")]),
+            StartupMode::Visible
+        );
+    }
 
     #[test]
     fn startup_message_preserves_the_cause_without_guessing_the_remedy() {
